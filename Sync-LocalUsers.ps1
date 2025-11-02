@@ -28,14 +28,13 @@ param(
 
 function New-RandomSecurePassword {
     param([int]$Length = 16)
-    # Build a mixed character set
     $charCodes = (48..57 + 65..90 + 97..122 + 33,35,36,37,38,42,64)
     $chars = foreach ($c in $charCodes) { [char]$c }
     $plain = -join (1..$Length | ForEach-Object { $chars | Get-Random })
     ConvertTo-SecureString $plain -AsPlainText -Force
 }
 
-# Built-in / system-managed locals to never delete
+# Built-in / system-managed locals we never delete or force out of groups
 $protectedBuiltIns = @(
     'Administrator','DefaultAccount','Guest','WDAGUtilityAccount',
     'sshd','ssh-agent','defaultuser0'
@@ -45,30 +44,29 @@ Write-Host "=== Sync-LocalUsers starting ===" -ForegroundColor Cyan
 Write-Host "CSV: $CsvPath"
 Write-Host ("Mode: " + ($(if ($Apply) { "APPLY (changes WILL be made)" } else { "PREVIEW (no changes)" }))) -ForegroundColor Yellow
 
-# Read desired users from CSV
+# Read desired users
 $desired = Import-Csv -Path $CsvPath
 if (-not $desired) { throw "CSV appears empty: $CsvPath" }
 
-# Normalize and validate CSV rows (PowerShell 5.1-safe)
+# Normalize rows (5.1-safe)
 $desired = $desired | ForEach-Object {
-    # Safely coerce to string before Trim()
     $u = if ($_.UserName) { [string]$_.UserName } else { "" }
     $f = if ($_.FullName) { [string]$_.FullName } else { "" }
     $d = if ($_.Description) { [string]$_.Description } else { "" }
     $p = if ($_.Password) { [string]$_.Password } else { "" }
-    $g = if ($_.Groups) { [string]$_.Groups } else { "" }
+    $r = if ($_.Role) { [string]$_.Role } else { "" }
 
-    $_.UserName   = $u.Trim()
-    $_.FullName   = $f.Trim()
-    $_.Description= $d.Trim()
-    $_.Password   = $p   # may be empty
-    $_.Groups     = $g   # may be empty or "G1;G2"
+    $_.UserName    = $u.Trim()
+    $_.FullName    = $f.Trim()
+    $_.Description = $d.Trim()
+    $_.Password    = $p
+    $_.Role        = $r.Trim()
     $_
 } | Where-Object { $_.UserName -and $_.UserName.Trim() -ne '' }
 
 if (-not $desired) { throw "No rows with a non-empty UserName were found in the CSV." }
 
-# Snapshot existing local users (requires Microsoft.PowerShell.LocalAccounts; run as admin)
+# Snapshot existing local users
 $existing = Get-LocalUser | Select-Object Name, Enabled, FullName, Description, SID, LastLogon
 
 if ($BackupPath) {
@@ -83,36 +81,29 @@ if ($BackupPath) {
 $existingNames = $existing.Name
 $desiredNames  = $desired.UserName
 
-# Deletions: local users present but NOT in desired list (excluding protected)
+# Delete users not in CSV (excluding protected)
 $toDelete = $existing | Where-Object {
     $name = $_.Name
     ($protectedBuiltIns -notcontains $name) -and
     ($desiredNames -notcontains $name)
 }
 
-# Creations: desired users missing locally
+# Create users in CSV that are missing
 $toCreate = $desired | Where-Object { $existingNames -notcontains $_.UserName }
 
-# Info splash
 Write-Host ""
 Write-Host "Planned deletions (excluding built-ins): $($toDelete.Count)" -ForegroundColor Magenta
 $toDelete | Select-Object Name, Enabled, Description | Format-Table -AutoSize
-
 Write-Host ""
 Write-Host "Planned creations: $($toCreate.Count)" -ForegroundColor Green
-$toCreate | Select-Object UserName, FullName, Description, Groups | Format-Table -AutoSize
+$toCreate | Select-Object UserName, FullName, Description, Role | Format-Table -AutoSize
 
-# --- APPLY CHANGES ---
-
-# Deletions
+# --- APPLY: deletions ---
 foreach ($usr in $toDelete) {
     if ($PSCmdlet.ShouldProcess("LOCAL USER '$($usr.Name)'", "Remove-LocalUser")) {
         try {
-            if ($Apply) {
-                Remove-LocalUser -Name $usr.Name -ErrorAction Stop
-            } else {
-                Remove-LocalUser -Name $usr.Name -WhatIf
-            }
+            if ($Apply) { Remove-LocalUser -Name $usr.Name -ErrorAction Stop }
+            else { Remove-LocalUser -Name $usr.Name -WhatIf }
             Write-Host "Deleted: $($usr.Name)" -ForegroundColor Magenta
         } catch {
             Write-Warning "Failed to delete '$($usr.Name)': $($_.Exception.Message)"
@@ -120,23 +111,16 @@ foreach ($usr in $toDelete) {
     }
 }
 
-# Creations
+# --- APPLY: creations ---
 foreach ($row in $toCreate) {
     $u    = $row.UserName
     $full = if ($row.FullName) { $row.FullName } else { $null }
     $desc = if ($row.Description) { $row.Description } else { $null }
 
-    # Password: from CSV (plain) -> SecureString, or random
     $secPwd = if ($row.Password) {
-        try {
-            ConvertTo-SecureString $row.Password -AsPlainText -Force
-        } catch {
-            Write-Warning "Password for '$u' couldn't be converted; using a random secure password."
-            New-RandomSecurePassword
-        }
-    } else {
-        New-RandomSecurePassword
-    }
+        try { ConvertTo-SecureString $row.Password -AsPlainText -Force }
+        catch { Write-Warning "Password for '$u' invalid; using a random password."; New-RandomSecurePassword }
+    } else { New-RandomSecurePassword }
 
     if ($PSCmdlet.ShouldProcess("LOCAL USER '$u'", "New-LocalUser")) {
         try {
@@ -151,29 +135,94 @@ foreach ($row in $toCreate) {
             continue
         }
     }
+}
 
-    # Group membership
-    if ($row.Groups) {
-        $groups = $row.Groups -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-        foreach ($g in $groups) {
-            if ($PSCmdlet.ShouldProcess("Add '$u' to local group '$g'", "Add-LocalGroupMember")) {
-                try {
-                    if ($Apply) {
-                        Add-LocalGroupMember -Group $g -Member $u -ErrorAction Stop
-                    } else {
-                        Add-LocalGroupMember -Group $g -Member $u -WhatIf
-                    }
-                    Write-Host "  -> Added '$u' to '$g'" -ForegroundColor DarkGreen
-                } catch {
-                    Write-Warning "  -> Failed to add '$u' to '$g': $($_.Exception.Message)"
-                }
+# -----------------------------
+# ENFORCE GROUP MEMBERSHIP (SAFE)
+# -----------------------------
+# We will:
+#  - Ensure CSV 'Administrator' users are members of Administrators
+#  - Ensure CSV 'User' users are members of Users
+#  - Remove any *local user* members (not protected) from those groups if they are not listed accordingly
+#  - We DO NOT touch domain accounts, domain groups, or protected built-ins
+
+function Get-DesiredSet {
+    param([string]$rolePattern) # e.g., '^administrator$' or '^user$'
+    $desired |
+        Where-Object {
+            $_.Role -and ($_.Role -match $rolePattern)
+        } |
+        Select-Object -ExpandProperty UserName
+}
+
+$desiredAdmins = Get-DesiredSet -rolePattern '^administrator(s)?$'
+$desiredUsers  = Get-DesiredSet -rolePattern '^user(s)?$'
+
+# Helper: add missing members
+function Ensure-Members {
+    param(
+        [string]$GroupName,
+        [string[]]$MemberNames
+    )
+    foreach ($name in $MemberNames) {
+        # Only add if local user exists (was created or already present)
+        if ($existingNames -notcontains $name) {
+            # If it was just created above, it may not be in $existingNames yet; retrieve live list:
+            $isLocal = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+            if (-not $isLocal) { continue }
+        }
+        if ($PSCmdlet.ShouldProcess("Add '$name' to '$GroupName'", "Add-LocalGroupMember")) {
+            try {
+                if ($Apply) { Add-LocalGroupMember -Group $GroupName -Member $name -ErrorAction Stop }
+                else { Add-LocalGroupMember -Group $GroupName -Member $name -WhatIf }
+                Write-Host "  -> Ensured '$name' in '$GroupName'" -ForegroundColor DarkGreen
+            } catch {
+                # Ignore if already a member / race conditions
+            }
+        }
+    }
+}
+
+# Helper: remove extra *local user* members that shouldn't be there
+function Prune-Extras {
+    param(
+        [string]$GroupName,
+        [string[]]$AllowedLocalUsers # local usernames that are allowed to be in this group
+    )
+
+    $members = Get-LocalGroupMember -Group $GroupName -ErrorAction SilentlyContinue
+    foreach ($m in $members) {
+        # Only consider local users (skip domain and groups and built-ins)
+        if ($m.ObjectClass -ne 'User' -or $m.PrincipalSource -ne 'Local') { continue }
+        $name = $m.Name
+        if ($protectedBuiltIns -contains $name) { continue }
+        if ($AllowedLocalUsers -contains $name) { continue }
+
+        if ($PSCmdlet.ShouldProcess("Remove '$name' from '$GroupName'", "Remove-LocalGroupMember")) {
+            try {
+                if ($Apply) { Remove-LocalGroupMember -Group $GroupName -Member $name -ErrorAction Stop }
+                else { Remove-LocalGroupMember -Group $GroupName -Member $name -WhatIf }
+                Write-Host "  -> Removed '$name' from '$GroupName'" -ForegroundColor DarkYellow
+            } catch {
+                Write-Warning "  -> Failed to remove '$name' from '$GroupName': $($_.Exception.Message)"
             }
         }
     }
 }
 
 Write-Host ""
-Write-Host "=== Sync-LocalUsers complete ===" -ForegroundColor Cyan
+Write-Host "Enforcing membership for 'Administrators' and 'Users'..." -ForegroundColor Cyan
+
+# Ensure required members exist
+Ensure-Members -GroupName 'Administrators' -MemberNames $desiredAdmins
+Ensure-Members -GroupName 'Users'          -MemberNames $desiredUsers
+
+# Prune extras (local user accounts only, non-protected)
+Prune-Extras -GroupName 'Administrators' -AllowedLocalUsers $desiredAdmins
+Prune-Extras -GroupName 'Users'          -AllowedLocalUsers $desiredUsers
+
+Write-Host ""
+Write-Host "=== Sync-LocalUsers complete (membership enforced) ===" -ForegroundColor Cyan
 if (-not $Apply) {
     Write-Host "No changes were made. Re-run with -Apply to enforce." -ForegroundColor Yellow
 }

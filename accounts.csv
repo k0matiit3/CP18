@@ -1,0 +1,3 @@
+﻿UserName,FullName,Description,Password,Groups
+jsmith,John Smith,Support analyst,P@ssw0rd!,Administrators;Remote Desktop Users
+ajones,Amy Jones,Service desk,P@ssw0rd!,Users

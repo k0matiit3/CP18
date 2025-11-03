@@ -1,33 +1,23 @@
 <# 
 Sync-LocalUsers-GUI.ps1  (PowerShell 5.1, ISE-friendly)
 
-INPUT OPTIONS
-- Paste users (one per line) into the big text box   OR   Load a CSV.
-- Accepted formats:
-  1) With headers (recommended):
-       UserName,FullName,Role,Description,ForceChangeAtNextLogon
-       dovahkiin,Dovah Kiin,Administrators,Dragonborn,TRUE
-  2) Headerless CSV (username,fullname,role,description):
-       lydia,Lydia,Users,Housecarl
-  3) Minimal (username,role):
-       balgruuf,Administrators
-
-WHAT IT DOES
-- Creates missing users (using the Default Password you supply).
-- Updates FullName/Description if changed.
-- Clears "Password never expires" for managed users.
-- If "Force PW change" is ticked per user or globally, triggers change-at-next-logon.
-- Enforces group membership for 'Administrators' and 'Users'.
-- (Optional) Deletes local users that are not on the list (safe exclusions applied).
+FEATURES
+- Paste users or Load CSV into grid (UserName, FullName, Role, Description, ForceChangeAtNextLogon).
+- Toggle each user's target group: Administrators or Users.
+- Default password for NEW accounts.
+- Enforce password expiration: clears "Password never expires" and can force change at next logon (per-user or global).
+- Enforce group membership for Administrators and Users.
+- Optional deletion of local users not in the list (safe exclusions applied).
+- WhatIf (dry-run) switch.
+- Import current local users into the grid (to start from what's on the box).
 
 SAFE EXCLUSIONS (never deleted)
-- Built-ins: Administrator, DefaultAccount, Guest, WDAGUtilityAccount, defaultuser0
+- Administrator, DefaultAccount, Guest, WDAGUtilityAccount, defaultuser0
 - The currently logged-in local account
-- Any account that is clearly NOT a local user (e.g., domain SIDs)
 
-NOTES
-- Requires: Microsoft.PowerShell.LocalAccounts module (Win 10+/Server 2016+).
+REQUIREMENTS
 - Run as Administrator.
+- Windows 10+/Server 2016+ (LocalAccounts module available).
 #>
 
 [CmdletBinding()]
@@ -58,28 +48,23 @@ function Normalize-Role([string]$role){
 
 function Read-DesiredUsersFromText([string]$text){
   $list = @()
-
   if ([string]::IsNullOrWhiteSpace($text)) { return $list }
 
   $lines = $text -split "(`r`n|`n|`r)"
   if ($lines.Count -eq 0) { return $list }
 
-  # Try to detect headers
+  # Detect headers
   $first = $lines | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1
   $hasHeader = $false
   if ($first -match "UserName" -or $first -match "FullName" -or $first -match "Role") { $hasHeader = $true }
 
   $idxStart = 0
-  if ($hasHeader) { 
-    # Skip header row
-    $idxStart = [Array]::IndexOf($lines, $first) + 1
-  }
+  if ($hasHeader) { $idxStart = [Array]::IndexOf($lines, $first) + 1 }
 
   for ($i = $idxStart; $i -lt $lines.Count; $i++) {
     $line = $lines[$i].Trim()
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
     $parts = $line -split ","
-    # Pad to 5 fields
     while ($parts.Count -lt 5) { $parts += "" }
 
     $u   = $parts[0].Trim()
@@ -104,7 +89,6 @@ function Read-DesiredUsersFromText([string]$text){
       ForceChangeAtNextLogon = $force
     }
   }
-
   return $list
 }
 
@@ -135,14 +119,16 @@ function Read-DesiredUsersFromCsvFile([string]$path){
 }
 
 function Get-SafeExclusions {
-  $builtIns = @(
-    "Administrator","DefaultAccount","Guest","WDAGUtilityAccount","defaultuser0"
-  )
-  $current = $env:USERNAME
+  $builtIns = @("Administrator","DefaultAccount","Guest","WDAGUtilityAccount","defaultuser0")
+  $current  = $env:USERNAME
   return ($builtIns + $current) | Sort-Object -Unique
 }
 
-function Ensure-LocalGroup([string]$group){ if (-not (Get-LocalGroup -Name $group -ErrorAction SilentlyContinue)) { throw "Local group not found: $group" } }
+function Ensure-LocalGroup([string]$group){
+  if (-not (Get-LocalGroup -Name $group -ErrorAction SilentlyContinue)) {
+    throw "Local group not found: $group"
+  }
+}
 
 function Ensure-User-ExistsOrCreate($row, [SecureString]$defaultPwd, [bool]$forceChangeGlobally, [bool]$whatIf=$false) {
   $u    = $row.UserName
@@ -159,13 +145,11 @@ function Ensure-User-ExistsOrCreate($row, [SecureString]$defaultPwd, [bool]$forc
   } else {
     # Update profile fields if changed
     $needUpdate = $false
-    if ($fn  -and $exists.FullName   -ne $fn)  { $needUpdate = $true }
+    if ($fn  -and $exists.FullName    -ne $fn)  { $needUpdate = $true }
     if ($desc -and $exists.Description -ne $desc) { $needUpdate = $true }
     if ($needUpdate) {
       Write-Host "  -> Updating FullName/Description for '$u'..." -ForegroundColor Cyan
-      if (-not $whatIf) {
-        Set-LocalUser -Name $u -FullName $fn -Description $desc | Out-Null
-      }
+      if (-not $whatIf) { Set-LocalUser -Name $u -FullName $fn -Description $desc | Out-Null }
     }
     # Always clear "password never expires"
     if ($exists.PasswordNeverExpires) {
@@ -179,9 +163,7 @@ function Ensure-User-ExistsOrCreate($row, [SecureString]$defaultPwd, [bool]$forc
   if ($row.ForceChangeAtNextLogon -or $forceChangeGlobally) { $force = $true }
   if ($force) {
     Write-Host "  -> Forcing '$u' to change password at next logon..." -ForegroundColor Yellow
-    if (-not $whatIf) {
-      cmd /c "net user `"$u`" /logonpasswordchg:yes" | Out-Null
-    }
+    if (-not $whatIf) { cmd /c "net user `"$u`" /logonpasswordchg:yes" | Out-Null }
   }
 }
 
@@ -199,11 +181,8 @@ function Enforce-GroupMembership($desired, [string]$groupName, [bool]$whatIf=$fa
     if (-not $present) {
       Write-Host "  -> Ensuring '$u' IN '$groupName'" -ForegroundColor Green
       if (-not $whatIf) {
-        try {
-          Add-LocalGroupMember -Group $groupName -Member $u -ErrorAction Stop
-        } catch {
-          Write-Warning "    Failed to add $($u): $($_.Exception.Message)"
-        }
+        try { Add-LocalGroupMember -Group $groupName -Member $u -ErrorAction Stop }
+        catch { Write-Warning "    Failed to add $($u): $($_.Exception.Message)" }
       }
     }
   }
@@ -211,18 +190,14 @@ function Enforce-GroupMembership($desired, [string]$groupName, [bool]$whatIf=$fa
   # Remove extra local users (but keep safe exclusions & non-local principals)
   $safe = Get-SafeExclusions
   foreach ($m in $members) {
-    # Only local users like COMPUTER\User
-    if ($m.Name -notmatch "^[^\\]+\\") { continue }
+    if ($m.Name -notmatch "^[^\\]+\\") { continue } # ignore domain/unknown principals
     $u = ($m.Name -split "\\")[-1]
     if ($safe -contains $u) { continue }
     if ($desiredSet -notcontains $u) {
       Write-Host "  -> Removing '$($m.Name)' FROM '$groupName'" -ForegroundColor DarkYellow
       if (-not $whatIf) {
-        try {
-          Remove-LocalGroupMember -Group $groupName -Member $m.Name -ErrorAction Stop
-        } catch {
-          Write-Warning "    Failed to remove $($m.Name): $($_.Exception.Message)"
-        }
+        try { Remove-LocalGroupMember -Group $groupName -Member $m.Name -ErrorAction Stop }
+        catch { Write-Warning "    Failed to remove $($m.Name): $($_.Exception.Message)" }
       }
     }
   }
@@ -237,17 +212,14 @@ function Enforce-Deletions($desiredNames, [bool]$whatIf=$false){
     if ($desiredNames -notcontains $u) {
       Write-Host "  -> Deleting local user '$u' (not on list)..." -ForegroundColor Magenta
       if (-not $whatIf) {
-        try {
-          Remove-LocalUser -Name $u -ErrorAction Stop
-        } catch {
-          Write-Warning "     Failed to delete $($u): $($_.Exception.Message)"
-        }
+        try { Remove-LocalUser -Name $u -ErrorAction Stop }
+        catch { Write-Warning "     Failed to delete $($u): $($_.Exception.Message)" }
       }
     }
   }
 }
 
-# ------------------- GUI -------------------
+# ------------------- GUI (Docked layout so buttons are always visible) -------------------
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -256,109 +228,135 @@ function Show-SyncGui {
 
   $form = New-Object System.Windows.Forms.Form
   $form.Text = "Sync Local Users"
-  $form.Size = New-Object System.Drawing.Size(980, 720)
+  $form.Size = New-Object System.Drawing.Size(1100, 800)
+  $form.MinimumSize = New-Object System.Drawing.Size(1000, 720)
   $form.StartPosition = "CenterScreen"
 
-  $anchorTopLeftRight  = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
-  $anchorBottomLeftRight = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
-  $anchorBottomLeft = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+  $dockFill   = [System.Windows.Forms.DockStyle]::Fill
+  $dockTop    = [System.Windows.Forms.DockStyle]::Top
+  $dockBottom = [System.Windows.Forms.DockStyle]::Bottom
+  $anchorBLR  = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 
-  # Paste box
+  # ===== Top panel (paste + controls) =====
+  $top = New-Object System.Windows.Forms.Panel
+  $top.Dock = $dockTop
+  $top.Height = 230
+  $form.Controls.Add($top)
+
   $lblPaste = New-Object System.Windows.Forms.Label
   $lblPaste.Text = "Paste users (CSV or lines: UserName,FullName,Role,Description,ForceChangeAtNextLogon):"
-  $lblPaste.Location = New-Object System.Drawing.Point(10,10)
-  $lblPaste.Size = New-Object System.Drawing.Size(820,20)
-  $form.Controls.Add($lblPaste)
+  $lblPaste.AutoSize = $true
+  $lblPaste.Location = New-Object System.Drawing.Point(8,8)
+  $top.Controls.Add($lblPaste)
 
   $txtPaste = New-Object System.Windows.Forms.TextBox
   $txtPaste.Multiline = $true
   $txtPaste.ScrollBars = "Vertical"
-  $txtPaste.Location = New-Object System.Drawing.Point(10, 30)
-  $txtPaste.Size = New-Object System.Drawing.Size(940, 160)
-  $txtPaste.Anchor = $anchorTopLeftRight
-  $form.Controls.Add($txtPaste)
+  $txtPaste.Location = New-Object System.Drawing.Point(8, 28)
+  $txtPaste.Size = New-Object System.Drawing.Size(1060, 140)
+  $txtPaste.Anchor = $anchorBLR -bor [System.Windows.Forms.AnchorStyles]::Top
+  $top.Controls.Add($txtPaste)
 
-  # Buttons row 1
-  $btnParse = New-Object System.Windows.Forms.Button
-  $btnParse.Text = "Parse from Paste"
-  $btnParse.Location = New-Object System.Drawing.Point(10, 200)
-  $btnParse.Size = New-Object System.Drawing.Size(140,28)
-  $form.Controls.Add($btnParse)
-
+  $btnParse   = New-Object System.Windows.Forms.Button
   $btnLoadCsv = New-Object System.Windows.Forms.Button
-  $btnLoadCsv.Text = "Load CSV..."
-  $btnLoadCsv.Location = New-Object System.Drawing.Point(160, 200)
-  $btnLoadCsv.Size = New-Object System.Drawing.Size(120,28)
-  $form.Controls.Add($btnLoadCsv)
-
   $btnSaveCsv = New-Object System.Windows.Forms.Button
-  $btnSaveCsv.Text = "Export CSV..."
-  $btnSaveCsv.Location = New-Object System.Drawing.Point(290, 200)
-  $btnSaveCsv.Size = New-Object System.Drawing.Size(120,28)
-  $form.Controls.Add($btnSaveCsv)
 
-  # Default password + options
+  $btnParse.Text   = "Parse from Paste"
+  $btnLoadCsv.Text = "Load CSV..."
+  $btnSaveCsv.Text = "Export CSV..."
+
+  $btnParse.Location   = New-Object System.Drawing.Point(8, 176)
+  $btnLoadCsv.Location = New-Object System.Drawing.Point(150, 176)
+  $btnSaveCsv.Location = New-Object System.Drawing.Point(270, 176)
+
+  foreach($b in @($btnParse,$btnLoadCsv,$btnSaveCsv)){ $b.Size = New-Object System.Drawing.Size(130,28); $top.Controls.Add($b) }
+
   $lblPwd = New-Object System.Windows.Forms.Label
   $lblPwd.Text = "Default password for NEW accounts:"
-  $lblPwd.Location = New-Object System.Drawing.Point(430, 205)
-  $lblPwd.Size = New-Object System.Drawing.Size(240,20)
-  $form.Controls.Add($lblPwd)
+  $lblPwd.AutoSize = $true
+  $lblPwd.Location = New-Object System.Drawing.Point(430,176)
+  $top.Controls.Add($lblPwd)
 
   $txtPwd = New-Object System.Windows.Forms.MaskedTextBox
   $txtPwd.UseSystemPasswordChar = $true
-  $txtPwd.Location = New-Object System.Drawing.Point(670, 202)
-  $txtPwd.Size = New-Object System.Drawing.Size(160,24)
-  $form.Controls.Add($txtPwd)
+  $txtPwd.Location = New-Object System.Drawing.Point(670,173)
+  $txtPwd.Size = New-Object System.Drawing.Size(180,24)
+  $top.Controls.Add($txtPwd)
 
   $chkForceAll = New-Object System.Windows.Forms.CheckBox
   $chkForceAll.Text = "Force PW change at next logon (all listed users)"
-  $chkForceAll.Location = New-Object System.Drawing.Point(10, 235)
-  $chkForceAll.Size = New-Object System.Drawing.Size(380,20)
-  $form.Controls.Add($chkForceAll)
+  $chkForceAll.AutoSize = $true
+  $chkForceAll.Location = New-Object System.Drawing.Point(8, 206)
+  $top.Controls.Add($chkForceAll)
 
   $chkDelete = New-Object System.Windows.Forms.CheckBox
   $chkDelete.Text = "Delete local users NOT in the list (safe exclusions apply)"
-  $chkDelete.Location = New-Object System.Drawing.Point(400, 235)
-  $chkDelete.Size = New-Object System.Drawing.Size(390,20)
-  $form.Controls.Add($chkDelete)
+  $chkDelete.AutoSize = $true
+  $chkDelete.Location = New-Object System.Drawing.Point(330, 206)
+  $top.Controls.Add($chkDelete)
 
-  # Grid
+  # ===== Middle: grid (fills remaining space) =====
   $grid = New-Object System.Windows.Forms.DataGridView
-  $grid.Location = New-Object System.Drawing.Point(10, 265)
-  $grid.Size = New-Object System.Drawing.Size(940, 330)
-  $grid.Anchor = $anchorBottomLeftRight
+  $grid.Dock = $dockFill
   $grid.AllowUserToAddRows = $false
   $grid.AutoSizeColumnsMode = 'Fill'
   $form.Controls.Add($grid)
 
-  # Log
+  # ===== Bottom panel (buttons + log) =====
+  $bottom = New-Object System.Windows.Forms.Panel
+  $bottom.Dock = $dockBottom
+  $bottom.Height = 180
+  $form.Controls.Add($bottom)
+
+  # Buttons strip (top of bottom panel)
+  $btnStrip = New-Object System.Windows.Forms.FlowLayoutPanel
+  $btnStrip.Dock = $dockTop
+  $btnStrip.Height = 42
+  $btnStrip.WrapContents = $false
+  $btnStrip.AutoScroll = $false
+  $btnStrip.Padding = New-Object System.Windows.Forms.Padding(6,6,6,6)
+  $bottom.Controls.Add($btnStrip)
+
+  $btnApply = New-Object System.Windows.Forms.Button
+  $btnApply.Text = "APPLY (Create/Update/Delete/Enforce)"
+  $btnApply.Width = 300
+
+  $btnImportLocal = New-Object System.Windows.Forms.Button
+  $btnImportLocal.Text = "Import Current Local Users → Grid"
+  $btnImportLocal.Width = 240
+
+  $btnWhatIf = New-Object System.Windows.Forms.CheckBox
+  $btnWhatIf.Text = "Dry-run (WhatIf)"
+  $btnWhatIf.AutoSize = $true
+  $btnWhatIf.Margin = '12,10,12,0'
+
+  $btnStrip.Controls.AddRange(@($btnApply,$btnImportLocal,$btnWhatIf))
+
+  # Log (fills rest of bottom panel)
   $txtLog = New-Object System.Windows.Forms.TextBox
   $txtLog.Multiline = $true
-  $txtLog.ReadOnly  = $true
+  $txtLog.ReadOnly = $true
   $txtLog.ScrollBars = "Vertical"
-  $txtLog.Location = New-Object System.Drawing.Point(10, 600)
-  $txtLog.Size = New-Object System.Drawing.Size(940, 80)
-  $txtLog.Anchor = $anchorBottomLeftRight
-  $form.Controls.Add($txtLog)
+  $txtLog.Dock = $dockFill
+  $bottom.Controls.Add($txtLog)
 
   function Log($s){
     $txtLog.AppendText( ("[{0}] {1}" -f (Get-Date).ToString("HH:mm:ss"), $s) + [Environment]::NewLine )
     Write-Host $s
   }
 
-  # Build DataTable for grid
+  # ===== Data backing for grid =====
   $dt = New-Object System.Data.DataTable
   foreach($col in @("UserName","FullName","Role","Description","ForceChangeAtNextLogon")){
     [void]$dt.Columns.Add($col)
   }
   $grid.DataSource = $dt
 
-  # Role column as dropdown
+  # Replace 'Role' with dropdown
   $roleCol = New-Object System.Windows.Forms.DataGridViewComboBoxColumn
   $roleCol.HeaderText = "Role"
   $roleCol.DataPropertyName = "Role"
   $roleCol.Items.AddRange(@("Administrators","Users"))
-  foreach($c in @($grid.Columns)){}
 
   for($idx=0; $idx -lt $grid.Columns.Count; $idx++){
     if ($grid.Columns[$idx].HeaderText -eq "Role") {
@@ -374,7 +372,7 @@ function Show-SyncGui {
   $sfd = New-Object System.Windows.Forms.SaveFileDialog
   $sfd.Filter = "CSV files (*.csv)|*.csv"
 
-  # Events
+  # ===== Event wiring =====
   $btnParse.Add_Click({
     try{
       $dt.Rows.Clear()
@@ -430,13 +428,31 @@ function Show-SyncGui {
     }
   })
 
-  # --- APPLY button ---
-  $btnApply = New-Object System.Windows.Forms.Button
-  $btnApply.Text = "APPLY (Create/Update/Delete/Enforce)"
-  $btnApply.Location = New-Object System.Drawing.Point(10, 560)
-  $btnApply.Size = New-Object System.Drawing.Size(310,32)
-  $btnApply.Anchor = $anchorBottomLeft
-  $form.Controls.Add($btnApply)
+  # Import current local users into the grid
+  $btnImportLocal.Add_Click({
+    try{
+      $dt.Rows.Clear()
+      $locals = Get-LocalUser
+      foreach($u in $locals){
+        $row = $dt.NewRow()
+        $row.UserName = $u.Name
+        $row.FullName = $u.FullName
+        $row.Description = $u.Description
+        # Determine role from current Admins membership
+        $isAdmin = $false
+        try {
+          $adms = Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue | Where-Object {
+            $_.ObjectClass -eq 'User' -and $_.Name -match "^[^\\]+\\$($u.Name)$"
+          }
+          if ($adms) { $isAdmin = $true }
+        } catch {}
+        $row.Role = if ($isAdmin) { "Administrators" } else { "Users" }
+        $row.ForceChangeAtNextLogon = "False"
+        $dt.Rows.Add($row)
+      }
+      Log "Imported $($dt.Rows.Count) current local user(s) into grid."
+    } catch { Log "ERROR importing local users: $($_.Exception.Message)" }
+  })
 
   $btnApply.Add_Click({
     try{
@@ -450,39 +466,40 @@ function Show-SyncGui {
           ForceChangeAtNextLogon = (("" + $r.ForceChangeAtNextLogon).Trim().ToLower() -in @("true","1","yes","y"))
         }
       }
-
-      # Basic validation
       $invalid = $desired | Where-Object { [string]::IsNullOrWhiteSpace($_.UserName) }
-      if ($invalid.Count -gt 0) { throw "One or more entries missing UserName." }
+      if ($invalid.Count -gt 0) { throw "One or more entries are missing UserName." }
 
       $defaultPwdPlain = "" + $txtPwd.Text
       $defaultPwd = To-SecureStringFromPlain $defaultPwdPlain
+      $whatIf = $btnWhatIf.Checked
 
       Log "=== Sync starting ==="
       Log "Users in grid: $($desired.Count)"
       Log "Delete non-listed users: $($chkDelete.Checked)"
       Log "Force change at next logon (global): $($chkForceAll.Checked)"
+      Log "WhatIf: $whatIf"
 
-      # Create / update each desired user
       foreach($row in $desired){
-        Ensure-User-ExistsOrCreate -row $row -defaultPwd $defaultPwd -forceChangeGlobally:$chkForceAll.Checked -whatIf:$false
+        Ensure-User-ExistsOrCreate -row $row -defaultPwd $defaultPwd -forceChangeGlobally:$chkForceAll.Checked -whatIf:$whatIf
       }
 
-      # Enforce Admins & Users group
       Log "Enforcing membership for 'Administrators'..."
-      Enforce-GroupMembership -desired $desired -groupName "Administrators" -whatIf:$false
+      Enforce-GroupMembership -desired $desired -groupName "Administrators" -whatIf:$whatIf
       Log "Enforcing membership for 'Users'..."
-      Enforce-GroupMembership -desired $desired -groupName "Users" -whatIf:$false
+      Enforce-GroupMembership -desired $desired -groupName "Users" -whatIf:$whatIf
 
-      # Deletions (if selected)
       if ($chkDelete.Checked) {
         $names = $desired | Select-Object -ExpandProperty UserName -Unique
         Log "Deleting non-listed local users (safe exclusions kept)..."
-        Enforce-Deletions -desiredNames $names -whatIf:$false
+        Enforce-Deletions -desiredNames $names -whatIf:$whatIf
       }
 
       Log "=== Sync complete ==="
-      [System.Windows.Forms.MessageBox]::Show("Sync complete.", "Sync Local Users", 'OK', 'Information') | Out-Null
+      if (-not $whatIf) {
+        [System.Windows.Forms.MessageBox]::Show("Sync complete.", "Sync Local Users", 'OK', 'Information') | Out-Null
+      } else {
+        [System.Windows.Forms.MessageBox]::Show("Dry-run finished. No changes were made.", "Sync Local Users", 'OK', 'Information') | Out-Null
+      }
     } catch {
       $msg = $_.Exception.Message
       Log "ERROR during apply: $msg"
@@ -490,7 +507,6 @@ function Show-SyncGui {
     }
   })
 
-  # Show the form
   $form.Add_Shown({ $form.Activate() })
   [void]$form.ShowDialog()
 }

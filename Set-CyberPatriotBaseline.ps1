@@ -34,6 +34,13 @@ function New-Folder {
   if(-not (Test-Path $Path)){ New-Item -ItemType Directory -Path $Path -Force | Out-Null }
 }
 
+function Ensure-RegistryKey {
+  param([Parameter(Mandatory)][string]$Path)
+  if (-not (Test-Path -Path $Path)) {
+    New-Item -Path $Path -Force | Out-Null
+  }
+}
+
 # ------------------- Baseline setters -------------------
 function Apply-PasswordAndLockoutPolicy {
   <#
@@ -58,8 +65,9 @@ function Write-SecurityOptionsRegistry {
       - Require SMB signing (client & server)
   #>
   Write-Host "Writing Security Options to registry..." -ForegroundColor Cyan
+
   $lsa = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
-  New-Item -Path $lsa -Force | Out-Null
+  Ensure-RegistryKey -Path $lsa
   New-ItemProperty -Path $lsa -Name "LimitBlankPasswordUse" -Value 1 -PropertyType DWord -Force | Out-Null
   New-ItemProperty -Path $lsa -Name "restrictanonymous"     -Value 1 -PropertyType DWord -Force | Out-Null
   New-ItemProperty -Path $lsa -Name "RestrictAnonymousSAM"  -Value 1 -PropertyType DWord -Force | Out-Null
@@ -68,8 +76,8 @@ function Write-SecurityOptionsRegistry {
 
   $wk = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters"
   $sv = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
-  New-Item -Path $wk -Force | Out-Null
-  New-Item -Path $sv -Force | Out-Null
+  Ensure-RegistryKey -Path $wk
+  Ensure-RegistryKey -Path $sv
   New-ItemProperty -Path $wk -Name "RequireSecuritySignature" -Value 1 -PropertyType DWord -Force | Out-Null
   New-ItemProperty -Path $wk -Name "EnableSecuritySignature"  -Value 1 -PropertyType DWord -Force | Out-Null
   New-ItemProperty -Path $sv -Name "RequireSecuritySignature" -Value 1 -PropertyType DWord -Force | Out-Null
@@ -108,8 +116,11 @@ function Ensure-AutomaticUpdates {
       Computer Config -> Administrative Templates -> Windows Components -> Windows Update
   #>
   Write-Host "Configuring Windows Update policy (Configure Automatic Updates = Enabled)..." -ForegroundColor Cyan
+
+  $wu = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
   $wuAU = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
-  if(-not (Test-Path $wuAU)){ New-Item -Path $wuAU -Force | Out-Null }
+  Ensure-RegistryKey -Path $wu
+  Ensure-RegistryKey -Path $wuAU
 
   New-ItemProperty -Path $wuAU -Name "NoAutoUpdate"         -Value 0 -PropertyType DWord -Force | Out-Null
   New-ItemProperty -Path $wuAU -Name "AUOptions"            -Value 4 -PropertyType DWord -Force | Out-Null
@@ -122,6 +133,7 @@ function Ensure-AutomaticUpdates {
   try{ Start-Service -Name wuauserv -ErrorAction SilentlyContinue }catch{ Write-Warning "wuauserv start: $($_.Exception.Message)" }
   try{ & sc.exe config wuauserv start= delayed-auto | Out-Null }catch{
     try{
+      Ensure-RegistryKey -Path "HKLM:\SYSTEM\CurrentControlSet\Services\wuauserv"
       New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\wuauserv" -Name "DelayedAutoStart" -Value 1 -PropertyType DWord -Force | Out-Null
     }catch{}
   }

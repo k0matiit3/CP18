@@ -26,7 +26,7 @@ SAFE EXCLUSIONS (never deleted)
 - Any account that is clearly NOT a local user (e.g., domain SIDs)
 
 NOTES
-- Requires: Microsoft.PowerShell.LocalAccounts module (present on Win 10+/Server 2016+).
+- Requires: Microsoft.PowerShell.LocalAccounts module (Win 10+/Server 2016+).
 - Run as Administrator.
 #>
 
@@ -180,7 +180,6 @@ function Ensure-User-ExistsOrCreate($row, [SecureString]$defaultPwd, [bool]$forc
   if ($force) {
     Write-Host "  -> Forcing '$u' to change password at next logon..." -ForegroundColor Yellow
     if (-not $whatIf) {
-      # 'net user <user> /logonpasswordchg:yes' works on local accounts
       cmd /c "net user `"$u`" /logonpasswordchg:yes" | Out-Null
     }
   }
@@ -188,7 +187,6 @@ function Ensure-User-ExistsOrCreate($row, [SecureString]$defaultPwd, [bool]$forc
 
 function Enforce-GroupMembership($desired, [string]$groupName, [bool]$whatIf=$false) {
   Ensure-LocalGroup $groupName
-  $computer = $env:COMPUTERNAME
   $members = Get-LocalGroupMember -Group $groupName -ErrorAction SilentlyContinue | Where-Object { $_.ObjectClass -eq 'User' }
   $desiredSet = $desired | Where-Object { $_.Role -eq $groupName } | Select-Object -ExpandProperty UserName -Unique
 
@@ -200,7 +198,13 @@ function Enforce-GroupMembership($desired, [string]$groupName, [bool]$whatIf=$fa
     }
     if (-not $present) {
       Write-Host "  -> Ensuring '$u' IN '$groupName'" -ForegroundColor Green
-      if (-not $whatIf) { try { Add-LocalGroupMember -Group $groupName -Member $u -ErrorAction Stop } catch { Write-Warning "    Failed to add $u: $($_.Exception.Message)" } }
+      if (-not $whatIf) {
+        try {
+          Add-LocalGroupMember -Group $groupName -Member $u -ErrorAction Stop
+        } catch {
+          Write-Warning "    Failed to add $($u): $($_.Exception.Message)"
+        }
+      }
     }
   }
 
@@ -213,7 +217,13 @@ function Enforce-GroupMembership($desired, [string]$groupName, [bool]$whatIf=$fa
     if ($safe -contains $u) { continue }
     if ($desiredSet -notcontains $u) {
       Write-Host "  -> Removing '$($m.Name)' FROM '$groupName'" -ForegroundColor DarkYellow
-      if (-not $whatIf) { try { Remove-LocalGroupMember -Group $groupName -Member $m.Name -ErrorAction Stop } catch { Write-Warning "    Failed to remove $($m.Name): $($_.Exception.Message)" } }
+      if (-not $whatIf) {
+        try {
+          Remove-LocalGroupMember -Group $groupName -Member $m.Name -ErrorAction Stop
+        } catch {
+          Write-Warning "    Failed to remove $($m.Name): $($_.Exception.Message)"
+        }
+      }
     }
   }
 }
@@ -227,7 +237,11 @@ function Enforce-Deletions($desiredNames, [bool]$whatIf=$false){
     if ($desiredNames -notcontains $u) {
       Write-Host "  -> Deleting local user '$u' (not on list)..." -ForegroundColor Magenta
       if (-not $whatIf) {
-        try { Remove-LocalUser -Name $u -ErrorAction Stop } catch { Write-Warning "     Failed to delete $u: $($_.Exception.Message)" }
+        try {
+          Remove-LocalUser -Name $u -ErrorAction Stop
+        } catch {
+          Write-Warning "     Failed to delete $($u): $($_.Exception.Message)"
+        }
       }
     }
   }
@@ -344,15 +358,14 @@ function Show-SyncGui {
   $roleCol.HeaderText = "Role"
   $roleCol.DataPropertyName = "Role"
   $roleCol.Items.AddRange(@("Administrators","Users"))
-  $i = 0
-  foreach($c in $grid.Columns){
-    if ($c.HeaderText -eq "Role") {
-      $idx = $c.Index
+  foreach($c in @($grid.Columns)){}
+
+  for($idx=0; $idx -lt $grid.Columns.Count; $idx++){
+    if ($grid.Columns[$idx].HeaderText -eq "Role") {
       $grid.Columns.RemoveAt($idx)
       $grid.Columns.Insert($idx, $roleCol)
       break
     }
-    $i++
   }
 
   # File dialogs

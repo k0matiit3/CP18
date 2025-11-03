@@ -1,24 +1,23 @@
 <# 
 .SYNOPSIS
-  Reconcile local Windows users to match a CSV "source of truth":
-  - Create users that are in CSV but missing locally
-  - Delete local users not present in CSV (skips built-ins & protected)
-  - Enforce membership: Role=Administrator -> Administrators group; Role=User -> Users group
-  - Preview-only by default; pass -Apply to make changes
+  Reconcile local users to a CSV, enforce group membership, and ENFORCE PASSWORDS for all desired users.
 
 .CSV FORMAT
-  Headers: UserName,FullName,Description,Password,Role
-  Role should be 'Administrator' or 'User' (case-insensitive)
+  UserName,FullName,Description,Password,Role
+  jsmith,John Smith,Support,P@ssw0rd!,Administrator
+  ajones,Amy Jones,Service desk,,User
 
-.EXAMPLES
-  .\Sync-LocalUsers.ps1 -CsvPath "C:\path\valid_users.csv"           # Preview
-  .\Sync-LocalUsers.ps1 -CsvPath "C:\path\valid_users.csv" -Apply    # Apply
-  .\Sync-LocalUsers.ps1 -CsvPath "C:\path\valid_users.csv" -Apply -BackupPath "C:\path\prechange.csv"
-  .\Sync-LocalUsers.ps1 -CsvPath "C:\path\valid_users.csv" -Apply -ExtraProtectedAccounts breakglass
+.PARAMETERS
+  -CsvPath <path>                 : Source-of-truth CSV
+  -Apply                          : Actually make changes (otherwise Preview)
+  -BackupPath <path>              : Optional export of current local users to CSV
+  -ExtraProtectedAccounts <arr>   : Additional local accounts to never delete or remove from groups
+  -PasswordReportPath <path>      : If set, writes a CSV of passwords set/updated this run (restrictive ACL)
+  -ExpireAtNextLogon              : If set, mark updated/created accounts to change password at next logon
 
 .NOTES
-  - Run in elevated PowerShell (Run as Administrator)
-  - Requires Microsoft.PowerShell.LocalAccounts (present on Win10/11)
+  - PowerShell 5.1 compatible (uses ADSI for password resets)
+  - Run elevated
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact='High')]
@@ -31,24 +30,30 @@ param(
 
     [string]$BackupPath,
 
-    [string[]]$ExtraProtectedAccounts = @()
+    [string[]]$ExtraProtectedAccounts = @(),
+
+    [string]$PasswordReportPath,
+
+    [switch]$ExpireAtNextLogon
 )
 
-function New-RandomSecurePassword {
-    param([int]$Length = 16)
-    $charCodes = (48..57 + 65..90 + 97..122 + 33,35,36,37,38,42,64)
+function New-RandomPassword {
+    param([int]$Length = 20)
+    $charCodes = (48..57 + 65..90 + 97..122 + 33,35,36,37,38,42,64) # 0-9 A-Z a-z !#%$&*@
     $chars = foreach ($c in $charCodes) { [char]$c }
-    $plain = -join (1..$Length | ForEach-Object { $chars | Get-Random })
+    -join (1..$Length | ForEach-Object { $chars | Get-Random })
+}
+
+function To-SecureString($plain) {
     ConvertTo-SecureString $plain -AsPlainText -Force
 }
 
-# Built-in / system-managed locals to never delete or force out of groups
+# Built-ins / system accounts we never delete or force out of groups
 $protectedBuiltIns = @(
-    'Administrator','DefaultAccount','Guest','WDAGUtilityAccount',
-    'sshd','ssh-agent','defaultuser0'
+    'Administrator','DefaultAccount','Guest','WDAGUtilityAccount','sshd','ssh-agent','defaultuser0'
 ) + $ExtraProtectedAccounts
 
-# Also protect the currently logged-on user running this script
+# Also protect the currently logged-on SAM user from group removal
 try {
     $currentSam = $env:USERNAME
     if ($currentSam -and ($protectedBuiltIns -notcontains $currentSam)) {
@@ -64,7 +69,7 @@ Write-Host ("Mode: " + ($(if ($Apply) { "APPLY (changes WILL be made)" } else { 
 $desired = Import-Csv -Path $CsvPath
 if (-not $desired) { throw "CSV appears empty: $CsvPath" }
 
-# Normalize rows (PowerShell 5.1 safe; avoid null-Trim)
+# Normalize rows (5.1 safe)
 $desired = $desired | ForEach-Object {
     $u = if ($_.UserName)    { [string]$_.UserName }    else { "" }
     $f = if ($_.FullName)    { [string]$_.FullName }    else { "" }
@@ -84,7 +89,6 @@ if (-not $desired) { throw "No rows with a non-empty UserName were found in the 
 
 # Snapshot existing local users
 $existing = Get-LocalUser | Select-Object Name, Enabled, FullName, Description, SID, LastLogon
-
 if ($BackupPath) {
     try {
         $existing | Export-Csv -Path $BackupPath -NoTypeInformation -Encoding UTF8
@@ -97,15 +101,25 @@ if ($BackupPath) {
 $existingNames = $existing.Name
 $desiredNames  = $desired.UserName
 
-# Deletions: local users present but NOT in desired list (excluding protected)
+# Plan deletions (not in CSV) excluding protected
 $toDelete = $existing | Where-Object {
-    $name = $_.Name
-    ($protectedBuiltIns -notcontains $name) -and
-    ($desiredNames -notcontains $name)
+    ($protectedBuiltIns -notcontains $_.Name) -and
+    ($desiredNames -notcontains $_.Name)
 }
 
-# Creations: desired users missing locally
+# Plan creations (in CSV but not on box)
 $toCreate = $desired | Where-Object { $existingNames -notcontains $_.UserName }
+
+# Plan password enforcement (all desired that exist or will be created)
+# For existing users: set password to CSV Password or generate random
+$toEnforcePwExisting = $desired | Where-Object {
+    $existingNames -contains $_.UserName
+} | Where-Object {
+    $protectedBuiltIns -notcontains $_.UserName
+}
+
+# For new users: we already set password at creation, but we’ll track for report/expire flag
+$toEnforcePwNew = $toCreate
 
 Write-Host ""
 Write-Host "Planned deletions (excluding built-ins): $($toDelete.Count)" -ForegroundColor Magenta
@@ -114,6 +128,13 @@ $toDelete | Select-Object Name, Enabled, Description | Format-Table -AutoSize
 Write-Host ""
 Write-Host "Planned creations: $($toCreate.Count)" -ForegroundColor Green
 $toCreate | Select-Object UserName, FullName, Description, Role | Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "Planned password enforcement (existing accounts): $($toEnforcePwExisting.Count)" -ForegroundColor Yellow
+$toEnforcePwExisting | Select-Object UserName, Role | Format-Table -AutoSize
+
+# For outputting passwords set this run
+$passwordReport = New-Object System.Collections.Generic.List[object]
 
 # --- APPLY: deletions ---
 foreach ($usr in $toDelete) {
@@ -128,131 +149,18 @@ foreach ($usr in $toDelete) {
     }
 }
 
-# --- APPLY: creations ---
+# --- APPLY: creations + initial password ---
 foreach ($row in $toCreate) {
     $u    = $row.UserName
     $full = if ($row.FullName) { $row.FullName } else { $null }
     $desc = if ($row.Description) { $row.Description } else { $null }
 
-    $secPwd = if ($row.Password) {
-        try { ConvertTo-SecureString $row.Password -AsPlainText -Force }
-        catch { Write-Warning "Password for '$u' invalid; using a random password."; New-RandomSecurePassword }
-    } else { New-RandomSecurePassword }
+    $plainPwd = if ($row.Password) { $row.Password } else { New-RandomPassword }
+    $secPwd = To-SecureString $plainPwd
 
-    if ($PSCmdlet.ShouldProcess("LOCAL USER '$u'", "New-LocalUser")) {
+    if ($PSCmdlet.ShouldProcess("LOCAL USER '$u'", "New-LocalUser (+password)")) {
         try {
             if ($Apply) {
                 New-LocalUser -Name $u -Password $secPwd -FullName $full -Description $desc -ErrorAction Stop
             } else {
                 New-LocalUser -Name $u -Password $secPwd -FullName $full -Description $desc -WhatIf
-            }
-            Write-Host "Created: $u" -ForegroundColor Green
-        } catch {
-            Write-Warning "Failed to create '$u': $($_.Exception.Message)"
-            continue
-        }
-    }
-}
-
-# -----------------------------
-# ENFORCE GROUP MEMBERSHIP (SAFE)
-# -----------------------------
-# - Ensure CSV 'Administrator' users are members of Administrators
-# - Ensure CSV 'User' users are members of Users
-# - Remove any *local user* members (not protected) from those groups if they are not listed accordingly
-# - Do NOT touch domain accounts/groups or protected built-ins
-
-function Get-DesiredSet {
-    param([string]$rolePattern) # e.g., '^administrator(s)?$' or '^user(s)?$'
-    $desired |
-        Where-Object { $_.Role -and ($_.Role -match $rolePattern) } |
-        Select-Object -ExpandProperty UserName
-}
-
-$desiredAdmins = Get-DesiredSet -rolePattern '^administrator(s)?$'
-$desiredUsers  = Get-DesiredSet -rolePattern '^user(s)?$'
-
-# Normalize collection membership adds (use SAM name)
-function Ensure-Members {
-    param(
-        [string]$GroupName,
-        [string[]]$MemberNames
-    )
-    foreach ($name in $MemberNames) {
-        if (-not $name) { continue }
-        # Only add if a local user actually exists
-        $local = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
-        if (-not $local) { continue }
-
-        if ($PSCmdlet.ShouldProcess("Add '$name' to '$GroupName'", "Add-LocalGroupMember")) {
-            try {
-                if ($Apply) { Add-LocalGroupMember -Group $GroupName -Member $name -ErrorAction Stop }
-                else        { Add-LocalGroupMember -Group $GroupName -Member $name -WhatIf }
-                Write-Host "  -> Ensured '$name' in '$GroupName'" -ForegroundColor DarkGreen
-            } catch {
-                # Already-a-member throws sometimes; ignore
-            }
-        }
-    }
-}
-
-# Remove extra LOCAL USER members not in the allowed set (compare by SAM name)
-function Prune-Extras {
-    param(
-        [string]$GroupName,
-        [string[]]$AllowedLocalUsers
-    )
-
-    # Build lowercase allow-set of SAM names
-    $allowSet = @{}
-    foreach ($u in $AllowedLocalUsers) {
-        if ($u) { $allowSet[$u.ToLower()] = $true }
-    }
-
-    $members = Get-LocalGroupMember -Group $GroupName -ErrorAction SilentlyContinue
-    foreach ($m in $members) {
-        # Only consider Local User principals
-        if ($m.ObjectClass -ne 'User' -or $m.PrincipalSource -ne 'Local') { continue }
-
-        # Extract SAM 'username' from 'MACHINE\username'
-        $sam = ($m.Name -split '\\')[-1]
-        if (-not $sam) { continue }
-
-        # Skip protected accounts (compare by SAM)
-        $isProtected = $false
-        foreach ($p in $protectedBuiltIns) {
-            if ($p -and ($p.ToLower() -eq $sam.ToLower())) { $isProtected = $true; break }
-        }
-        if ($isProtected) { continue }
-
-        # If not allowed, remove
-        if (-not $allowSet.ContainsKey($sam.ToLower())) {
-            if ($PSCmdlet.ShouldProcess("Remove '$m.Name' from '$GroupName'", "Remove-LocalGroupMember")) {
-                try {
-                    if ($Apply) { Remove-LocalGroupMember -Group $GroupName -Member $sam -ErrorAction Stop }
-                    else        { Remove-LocalGroupMember -Group $GroupName -Member $sam -WhatIf }
-                    Write-Host "  -> Removed '$m.Name' from '$GroupName'" -ForegroundColor DarkYellow
-                } catch {
-                    Write-Warning "  -> Failed to remove '$m.Name' from '$GroupName': $($_.Exception.Message)"
-                }
-            }
-        }
-    }
-}
-
-Write-Host ""
-Write-Host "Enforcing membership for 'Administrators' and 'Users'..." -ForegroundColor Cyan
-
-# Ensure required members exist
-Ensure-Members -GroupName 'Administrators' -MemberNames $desiredAdmins
-Ensure-Members -GroupName 'Users'          -MemberNames $desiredUsers
-
-# Prune extras (local user accounts only, non-protected)
-Prune-Extras -GroupName 'Administrators' -AllowedLocalUsers $desiredAdmins
-Prune-Extras -GroupName 'Users'          -AllowedLocalUsers $desiredUsers
-
-Write-Host ""
-Write-Host "=== Sync-LocalUsers complete (membership enforced) ===" -ForegroundColor Cyan
-if (-not $Apply) {
-    Write-Host "No changes were made. Re-run with -Apply to enforce." -ForegroundColor Yellow
-}

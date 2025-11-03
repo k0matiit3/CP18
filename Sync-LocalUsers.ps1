@@ -232,4 +232,90 @@ function Ensure-Members {
         if (-not $name) { continue }
         $local = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
         if (-not $local) { continue }
-        if
+        if ($PSCmdlet.ShouldProcess("Add '$name' to '$GroupName'", "Add-LocalGroupMember")) {
+            try {
+                if ($Apply) {
+                    Add-LocalGroupMember -Group $GroupName -Member $name -ErrorAction Stop
+                } else {
+                    Add-LocalGroupMember -Group $GroupName -Member $name -WhatIf
+                }
+                Write-Host "  -> Ensured '$name' in '$GroupName'" -ForegroundColor DarkGreen
+            } catch {
+                # ignore if already a member, etc.
+            }
+        }
+    }
+}
+
+function Prune-Extras {
+    param([string]$GroupName,[string[]]$AllowedLocalUsers)
+
+    $allowSet = @{}
+    foreach ($u in $AllowedLocalUsers) {
+        if ($u) { $allowSet[$u.ToLower()] = $true }
+    }
+
+    $members = Get-LocalGroupMember -Group $GroupName -ErrorAction SilentlyContinue
+    foreach ($m in $members) {
+        if ($m.ObjectClass -ne 'User' -or $m.PrincipalSource -ne 'Local') { continue }
+        $sam = ($m.Name -split '\\')[-1]
+        if (-not $sam) { continue }
+
+        $isProtected = $false
+        foreach ($p in $protectedBuiltIns) {
+            if ($p -and ($p.ToLower() -eq $sam.ToLower())) { $isProtected = $true; break }
+        }
+        if ($isProtected) { continue }
+
+        if (-not $allowSet.ContainsKey($sam.ToLower())) {
+            if ($PSCmdlet.ShouldProcess("Remove '$m.Name' from '$GroupName'", "Remove-LocalGroupMember")) {
+                try {
+                    if ($Apply) {
+                        Remove-LocalGroupMember -Group $GroupName -Member $sam -ErrorAction Stop
+                    } else {
+                        Remove-LocalGroupMember -Group $GroupName -Member $sam -WhatIf
+                    }
+                    Write-Host "  -> Removed '$m.Name' from '$GroupName'" -ForegroundColor DarkYellow
+                } catch {
+                    Write-Warning "  -> Failed to remove '$m.Name' from '$GroupName': $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+}
+
+Write-Host ""
+Write-Host "Enforcing membership for 'Administrators' and 'Users'..." -ForegroundColor Cyan
+Ensure-Members -GroupName 'Administrators' -MemberNames $desiredAdmins
+Ensure-Members -GroupName 'Users'          -MemberNames $desiredUsers
+Prune-Extras   -GroupName 'Administrators' -AllowedLocalUsers $desiredAdmins
+Prune-Extras   -GroupName 'Users'          -AllowedLocalUsers $desiredUsers
+
+# -----------------------------
+# PASSWORD REPORT (optional)
+# -----------------------------
+if ($PasswordReportPath) {
+    try {
+        if ($passwordReport.Count -gt 0) {
+            $passwordReport | Export-Csv -Path $PasswordReportPath -NoTypeInformation -Encoding UTF8
+
+            # Tighten ACL: grant current user FullControl only
+            $currentUserName = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $acl = Get-Acl -Path $PasswordReportPath
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($currentUserName,"FullControl","Allow")
+            $acl.SetAccessRuleProtection($true,$false)  # disable inheritance
+            $acl.SetAccessRule($rule)
+            Set-Acl -Path $PasswordReportPath -AclObject $acl
+
+            Write-Host "Password report written to: $PasswordReportPath  (restricted ACL)" -ForegroundColor Yellow
+        } else {
+            Write-Host "No passwords were changed; no report written." -ForegroundColor DarkGray
+        }
+    } catch {
+        Write-Warning "Failed to write/secure password report '$PasswordReportPath': $($_.Exception.Message)"
+    }
+}
+
+Write-Host ""
+Write-Host "=== Sync-LocalUsers complete (passwords enforced, membership enforced) ===" -ForegroundColor Cyan
+if (-not $Apply) { Write-Host "No changes were made. Re-run with -Apply to enforce." -ForegroundColor Yellow }

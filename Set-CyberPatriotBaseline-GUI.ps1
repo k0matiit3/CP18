@@ -2,11 +2,11 @@
 Set-CyberPatriotBaseline-GUI.ps1
 PowerShell 5.1, ISE-friendly, no-secedit. WinForms GUI to apply Windows hardening items individually.
 
-Includes:
-- Scrollable checkbox panel, pinned buttons row.
-- "Recommended CP Defaults" button to auto-select a sensible CyberPatriot baseline.
+This build:
+- Action/Notification Center toggle included and ON in the Recommended CP Defaults preset.
+- STRICT preset for NetBIOS + LLMNR (both disabled in preset).
 
-Some settings (SChannel/TLS, SMB protocol, some services) may require a reboot.
+Some settings (SChannel/TLS, SMB protocol, some services) require a reboot/sign-out.
 #>
 
 [CmdletBinding()]
@@ -27,6 +27,7 @@ function Ensure-RegistryKey { param([Parameter(Mandatory)][string]$Path) if (-no
 function Set-RegDWORD { param([string]$Path,[string]$Name,[int]$Value) Ensure-RegistryKey -Path $Path; New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType DWord -Force | Out-Null }
 function Set-RegString { param([string]$Path,[string]$Name,[string]$Value) Ensure-RegistryKey -Path $Path; New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType String -Force | Out-Null }
 function Set-RegMultiSz { param([string]$Path,[string]$Name,[string[]]$Values) Ensure-RegistryKey -Path $Path; New-ItemProperty -Path $Path -Name $Name -Value $Values -PropertyType MultiString -Force | Out-Null }
+function Run-GPUpdate { try { gpupdate /target:computer /force | Out-Null } catch {} }
 
 # ------------------- Baseline setters (core) -------------------
 function Apply-PasswordAndLockoutPolicy {
@@ -94,7 +95,6 @@ function Ensure-AutomaticUpdates {
     try { & sc.exe config wuauserv start= delayed-auto | Out-Null } catch {}
   }
 }
-function Run-GPUpdate { try { gpupdate /target:computer /force | Out-Null } catch {} }
 
 # ------------------- EXTRA hardening buckets -------------------
 function Harden-NTLM {
@@ -169,6 +169,46 @@ function Disable-ProblemServices {
 }
 function Tune-EventLog { Write-Host "Tuning Security event log..." -ForegroundColor Cyan; $sec="HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security"; Set-RegDWORD $sec "MaxSize" 196608; Set-RegDWORD $sec "Retention" 0 }
 
+# ------------------- NEW: Action/Notification Center enablement -------------------
+function Enable-ActionCenter {
+  Write-Host "Enabling Action/Notification Center..." -ForegroundColor Cyan
+
+  # Remove policy-based disables
+  foreach ($hive in @('HKCU:\Software\Policies\Microsoft\Windows\Explorer','HKLM:\Software\Policies\Microsoft\Windows\Explorer')) {
+    if (Test-Path $hive) {
+      try { Remove-ItemProperty -Path $hive -Name 'DisableNotificationCenter' -ErrorAction SilentlyContinue } catch {}
+    }
+  }
+
+  # Ensure toasts are enabled
+  $push = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\PushNotifications'
+  Ensure-RegistryKey -Path $push
+  Set-RegDWORD $push 'ToastEnabled' 1
+
+  # Unhide Security/Action Center icon if hidden by policy
+  $pol = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+  if (Test-Path $pol) {
+    try { Remove-ItemProperty -Path $pol -Name 'HideSCAHealth' -ErrorAction SilentlyContinue } catch {}
+  }
+
+  # Make sure required services are Automatic and running
+  foreach ($svc in @('WpnService','wscsvc')) {
+    try {
+      Set-Service -Name $svc -StartupType Automatic -ErrorAction SilentlyContinue
+      Start-Service -Name $svc -ErrorAction SilentlyContinue
+    } catch {}
+  }
+  # Per-user push notification service (name has a suffix)
+  Get-Service -Name 'WpnUserService*' -ErrorAction SilentlyContinue | ForEach-Object {
+    try {
+      Set-Service -Name $_.Name -StartupType Automatic -ErrorAction SilentlyContinue
+      Start-Service -Name $_.Name -ErrorAction SilentlyContinue
+    } catch {}
+  }
+
+  Write-Host "Action/Notification Center enabled. If the icon is still missing, sign out/in or reboot." -ForegroundColor Green
+}
+
 # ------------------- Verification -------------------
 function Verify-And-Report {
   Write-Host "`n===== Verification =====" -ForegroundColor White
@@ -205,7 +245,17 @@ function Verify-And-Report {
     ShowVal ("HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\{0}\Server" -f $p) "Enabled"
     ShowVal ("HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\{0}\Client" -f $p) "Enabled"
   }
-  foreach ($svc in "RemoteRegistry","SSDPSRV","upnphost") { try { ("Service {0} : {1}" -f $svc, (Get-Service $svc -ErrorAction Stop).Status) | Write-Host } catch {} }
+  foreach ($svc in "RemoteRegistry","SSDPSRV","upnphost","WpnService","wscsvc") { 
+    try { ("Service {0} : {1}" -f $svc, (Get-Service $svc -ErrorAction Stop).Status) | Write-Host } catch {} 
+  }
+  $wpnUser = Get-Service -Name 'WpnUserService*' -ErrorAction SilentlyContinue
+  if ($wpnUser) { $wpnUser | ForEach-Object { "Service $($_.Name) : $($_.Status)" | Write-Host } }
+
+  ShowVal "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\PushNotifications" "ToastEnabled"
+  ShowVal "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" "HideSCAHealth"
+  ShowVal "HKCU:\Software\Policies\Microsoft\Windows\Explorer" "DisableNotificationCenter"
+  ShowVal "HKLM:\Software\Policies\Microsoft\Windows\Explorer" "DisableNotificationCenter"
+
   ShowVal "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security" "MaxSize"
   ShowVal "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security" "Retention"
   ShowVal "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "AUOptions"
@@ -221,24 +271,24 @@ function Show-BaselineGui {
 
   $form = New-Object System.Windows.Forms.Form
   $form.Text = "CyberPatriot Baseline - Select Features"
-  $form.Size = New-Object System.Drawing.Size(840, 820)
-  $form.MinimumSize = New-Object System.Drawing.Size(840, 820)
+  $form.Size = New-Object System.Drawing.Size(860, 860)
+  $form.MinimumSize = New-Object System.Drawing.Size(860, 860)
   $form.StartPosition = "CenterScreen"
 
-  # Anchor flags (avoid strings on PS 5.1)
-  $anchorTopLeftRight  = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
-  $anchorBottomLeft    = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+  # Anchor flags (PS 5.1 safe)
+  $anchorTopLeftRight    = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+  $anchorBottomLeft      = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
   $anchorBottomLeftRight = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 
   # Scrollable checkbox panel
   $panel = New-Object System.Windows.Forms.Panel
   $panel.Location  = New-Object System.Drawing.Point(10, 10)
-  $panel.Size      = New-Object System.Drawing.Size(800, 520)
+  $panel.Size      = New-Object System.Drawing.Size(820, 560)
   $panel.AutoScroll = $true
   $panel.Anchor     = $anchorTopLeftRight
   $form.Controls.Add($panel)
 
-  $y = 10; $x = 10; $width = 760; $rowH = 22
+  $y = 10; $x = 10; $width = 780; $rowH = 22
   $cb = @{}
 
   function NewCB($name,$text,$checked=$true){
@@ -279,6 +329,9 @@ function Show-BaselineGui {
   NewCB 'BadServices'  "Disable services: RemoteRegistry, SSDPSRV, upnphost"
   NewCB 'EventLog'     "Security log: ~192MB, overwrite as needed"
 
+  # NEW: Action/Notification Center
+  NewCB 'ActionCenter' "Enable Action/Notification Center (unblock policies, enable toasts, start Wpn* and wscsvc)" $true
+
   # Buttons row
   $btnApply  = New-Object System.Windows.Forms.Button
   $btnVerify = New-Object System.Windows.Forms.Button
@@ -294,20 +347,20 @@ function Show-BaselineGui {
   $btnAll.Text    = "Select All"
   $btnNone.Text   = "Deselect All"
   $btnGP.Text     = "gpupdate /force"
-  $btnPreset.Text = "Recommended CP Defaults"
+  $btnPreset.Text = "Recommended CP Defaults (STRICT)"
 
-  $buttonsTop = 540
+  $buttonsTop = 580
   $btnApply.Location  = New-Object System.Drawing.Point(10,  $buttonsTop)
   $btnVerify.Location = New-Object System.Drawing.Point(170, $buttonsTop)
   $btnPreset.Location = New-Object System.Drawing.Point(330, $buttonsTop)
-  $btnAll.Location    = New-Object System.Drawing.Point(530, $buttonsTop)
-  $btnNone.Location   = New-Object System.Drawing.Point(660, $buttonsTop)
+  $btnAll.Location    = New-Object System.Drawing.Point(570, $buttonsTop)
+  $btnNone.Location   = New-Object System.Drawing.Point(690, $buttonsTop)
   $buttonsTop2 = $buttonsTop + 40
   $btnGP.Location     = New-Object System.Drawing.Point(10,  $buttonsTop2)
 
   $btnApply.Size  = New-Object System.Drawing.Size(150,32)
   $btnVerify.Size = New-Object System.Drawing.Size(150,32)
-  $btnPreset.Size = New-Object System.Drawing.Size(190,32)
+  $btnPreset.Size = New-Object System.Drawing.Size(220,32)
   $btnAll.Size    = New-Object System.Drawing.Size(120,32)
   $btnNone.Size   = New-Object System.Drawing.Size(120,32)
   $btnGP.Size     = New-Object System.Drawing.Size(150,32)
@@ -324,25 +377,25 @@ function Show-BaselineGui {
   $txt.Multiline = $true
   $txt.ReadOnly  = $true
   $txt.ScrollBars = "Vertical"
-  $txt.Size = New-Object System.Drawing.Size(800, 200)
-  $txt.Location = New-Object System.Drawing.Point(10, 580)
+  $txt.Size = New-Object System.Drawing.Size(820, 200)
+  $txt.Location = New-Object System.Drawing.Point(10, 620)
   $txt.Anchor = $anchorBottomLeftRight
   $form.Controls.Add($txt)
 
   function Log($s){ $line = ("[{0}] {1}" -f (Get-Date).ToString("HH:mm:ss"), $s); $txt.AppendText($line + [Environment]::NewLine); Write-Host $s }
 
-  # Preset selector
+  # Preset selector (STRICT: LLMNR OFF, NetBIOS OFF, ActionCenter ON)
   function Select-Recommended {
     foreach($k in $cb.Keys){ $cb[$k].Checked = $false }
     foreach($k in @(
       # Core
       'PwdLockout','PwdRegistry','SecOptions','WinRM','Audit','Firewall','WU','DisableRDP',
-      # Extras most commonly scored
-      'NTLM','RemoteAssist','SMB1','NullSess','LLMNR','UAC','AutoRun','Defender','TLS','BadServices','EventLog',
-      # Often good to include
-      'ScreenLock',
-      # Safe networking extra (toggle if your image requires NetBIOS)
-      'NetBIOS'
+      # Extras commonly scored
+      'NTLM','RemoteAssist','SMB1','NullSess','UAC','AutoRun','Defender','TLS','BadServices','EventLog','ScreenLock',
+      # STRICT networking
+      'LLMNR','NetBIOS',
+      # Keep notifications usable
+      'ActionCenter'
     )) { $cb[$k].Checked = $true }
   }
 
@@ -378,10 +431,11 @@ function Show-BaselineGui {
       if ($cb.TLS.Checked)          { Log " - SChannel TLS hardening";     Harden-SChannel }
       if ($cb.BadServices.Checked)  { Log " - Disable services";           Disable-ProblemServices }
       if ($cb.EventLog.Checked)     { Log " - Tune Security log";          Tune-EventLog }
+      if ($cb.ActionCenter.Checked) { Log " - Enable Action/Notification Center"; Enable-ActionCenter }
 
       Log "Applying gpupdate (recommended)..."
       Run-GPUpdate
-      Log "Done. Consider reboot for TLS/SMB/protocol changes."
+      Log "Done. Some changes may require sign-out/reboot (TLS/SMB/protocols, tray icons)."
       [System.Windows.Forms.MessageBox]::Show("Selected items applied.", "Baseline", 'OK', 'Information') | Out-Null
     } catch {
       [System.Windows.Forms.MessageBox]::Show("Error: $($_.Exception.Message)", "Baseline", 'OK', 'Error') | Out-Null

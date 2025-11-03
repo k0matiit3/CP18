@@ -13,7 +13,7 @@
   -BackupPath <path>              : Optional export of current local users to CSV
   -ExtraProtectedAccounts <arr>   : Additional local accounts to never delete or remove from groups
   -PasswordReportPath <path>      : If set, writes a CSV of passwords set/updated this run (restrictive ACL)
-  -ExpireAtNextLogon              : If set, mark updated/created accounts to change password at next logon
+  -ExpireAtNextLogon              : Mark updated/created accounts to change password at next logon
 
 .NOTES
   - PowerShell 5.1 compatible (uses ADSI for password resets)
@@ -111,14 +111,12 @@ $toDelete = $existing | Where-Object {
 $toCreate = $desired | Where-Object { $existingNames -notcontains $_.UserName }
 
 # Plan password enforcement (all desired that exist or will be created)
-# For existing users: set password to CSV Password or generate random
 $toEnforcePwExisting = $desired | Where-Object {
     $existingNames -contains $_.UserName
 } | Where-Object {
     $protectedBuiltIns -notcontains $_.UserName
 }
 
-# For new users: we already set password at creation, but we’ll track for report/expire flag
 $toEnforcePwNew = $toCreate
 
 Write-Host ""
@@ -140,8 +138,11 @@ $passwordReport = New-Object System.Collections.Generic.List[object]
 foreach ($usr in $toDelete) {
     if ($PSCmdlet.ShouldProcess("LOCAL USER '$($usr.Name)'", "Remove-LocalUser")) {
         try {
-            if ($Apply) { Remove-LocalUser -Name $usr.Name -ErrorAction Stop }
-            else        { Remove-LocalUser -Name $usr.Name -WhatIf }
+            if ($Apply) {
+                Remove-LocalUser -Name $usr.Name -ErrorAction Stop
+            } else {
+                Remove-LocalUser -Name $usr.Name -WhatIf
+            }
             Write-Host "Deleted: $($usr.Name)" -ForegroundColor Magenta
         } catch {
             Write-Warning "Failed to delete '$($usr.Name)': $($_.Exception.Message)"
@@ -164,3 +165,71 @@ foreach ($row in $toCreate) {
                 New-LocalUser -Name $u -Password $secPwd -FullName $full -Description $desc -ErrorAction Stop
             } else {
                 New-LocalUser -Name $u -Password $secPwd -FullName $full -Description $desc -WhatIf
+            }
+
+            Write-Host "Created: $u" -ForegroundColor Green
+
+            if ($Apply) {
+                try {
+                    $adsi = [ADSI]"WinNT://./$u,user"
+                    $adsi.PasswordRequired = $true
+                    if ($ExpireAtNextLogon) { $adsi.PasswordExpired = 1 }
+                    $adsi.SetInfo()
+                } catch {
+                    Write-Warning "  -> Could not set PasswordRequired/Expired for '$u': $($_.Exception.Message)"
+                }
+            }
+
+            $passwordReport.Add([pscustomobject]@{ UserName=$u; Password=$plainPwd; Action='Created' })
+        } catch {
+            Write-Warning "Failed to create '$u': $($_.Exception.Message)"
+            continue
+        }
+    }
+}
+
+# --- APPLY: ENFORCE PASSWORDS for existing desired users ---
+foreach ($row in $toEnforcePwExisting) {
+    $u = $row.UserName
+    if ($protectedBuiltIns -contains $u) { continue }
+
+    $plainPwd = if ($row.Password) { $row.Password } else { New-RandomPassword }
+
+    if ($PSCmdlet.ShouldProcess("LOCAL USER '$u'", "Reset password & enforce 'Password required'")) {
+        try {
+            if ($Apply) {
+                $adsi = [ADSI]"WinNT://./$u,user"
+                $adsi.SetPassword($plainPwd)
+                $adsi.PasswordRequired = $true
+                if ($ExpireAtNextLogon) { $adsi.PasswordExpired = 1 }
+                $adsi.SetInfo()
+            } else {
+                Write-Host "WhatIf: would reset password for '$u' and enforce PasswordRequired" -ForegroundColor Yellow
+            }
+
+            Write-Host "Password enforced for: $u" -ForegroundColor DarkYellow
+            $passwordReport.Add([pscustomobject]@{ UserName=$u; Password=$plainPwd; Action='PasswordReset' })
+        } catch {
+            Write-Warning "Failed to enforce password for '$u': $($_.Exception.Message)"
+        }
+    }
+}
+
+# -----------------------------
+# ENFORCE GROUP MEMBERSHIP
+# -----------------------------
+function Get-DesiredSet {
+    param([string]$rolePattern)
+    $desired | Where-Object { $_.Role -and ($_.Role -match $rolePattern) } | Select-Object -ExpandProperty UserName
+}
+
+$desiredAdmins = Get-DesiredSet -rolePattern '^administrator(s)?$'
+$desiredUsers  = Get-DesiredSet -rolePattern '^user(s)?$'
+
+function Ensure-Members {
+    param([string]$GroupName,[string[]]$MemberNames)
+    foreach ($name in $MemberNames) {
+        if (-not $name) { continue }
+        $local = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+        if (-not $local) { continue }
+        if

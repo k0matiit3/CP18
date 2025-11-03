@@ -4,9 +4,9 @@ PowerShell 5.1, ISE-friendly, no-secedit. WinForms GUI to apply Windows hardenin
 
 Includes:
 - Scrollable checkbox panel, pinned buttons row.
-- NEW: "Recommended CP Defaults" button to auto-select a sensible CyberPatriot baseline.
+- "Recommended CP Defaults" button to auto-select a sensible CyberPatriot baseline.
 
-Some settings (e.g., SChannel/TLS, SMB protocol) may require a reboot to fully take effect.
+Some settings (SChannel/TLS, SMB protocol, some services) may require a reboot.
 #>
 
 [CmdletBinding()]
@@ -225,12 +225,17 @@ function Show-BaselineGui {
   $form.MinimumSize = New-Object System.Drawing.Size(840, 820)
   $form.StartPosition = "CenterScreen"
 
+  # Anchor flags (avoid strings on PS 5.1)
+  $anchorTopLeftRight  = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+  $anchorBottomLeft    = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+  $anchorBottomLeftRight = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+
   # Scrollable checkbox panel
   $panel = New-Object System.Windows.Forms.Panel
-  $panel.Location = New-Object System.Drawing.Point(10, 10)
-  $panel.Size     = New-Object System.Drawing.Size(800, 520)
+  $panel.Location  = New-Object System.Drawing.Point(10, 10)
+  $panel.Size      = New-Object System.Drawing.Size(800, 520)
   $panel.AutoScroll = $true
-  $panel.Anchor = "Top,Left,Right"
+  $panel.Anchor     = $anchorTopLeftRight
   $form.Controls.Add($panel)
 
   $y = 10; $x = 10; $width = 760; $rowH = 22
@@ -280,33 +285,39 @@ function Show-BaselineGui {
   $btnAll    = New-Object System.Windows.Forms.Button
   $btnNone   = New-Object System.Windows.Forms.Button
   $btnGP     = New-Object System.Windows.Forms.Button
-  $btnPreset = New-Object System.Windows.Forms.Button  # NEW
+  $btnPreset = New-Object System.Windows.Forms.Button
 
-  foreach($b in @($btnApply,$btnVerify,$btnAll,$btnNone,$btnGP,$btnPreset)){ $b.Anchor = "Bottom,Left" }
+  foreach($b in @($btnApply,$btnVerify,$btnAll,$btnNone,$btnGP,$btnPreset)){ $b.Anchor = $anchorBottomLeft }
 
   $btnApply.Text  = "Apply Selected"
   $btnVerify.Text = "Verify Only"
   $btnAll.Text    = "Select All"
   $btnNone.Text   = "Deselect All"
   $btnGP.Text     = "gpupdate /force"
-  $btnPreset.Text = "Recommended CP Defaults"  # NEW
+  $btnPreset.Text = "Recommended CP Defaults"
 
   $buttonsTop = 540
   $btnApply.Location  = New-Object System.Drawing.Point(10,  $buttonsTop)
   $btnVerify.Location = New-Object System.Drawing.Point(170, $buttonsTop)
-  $btnPreset.Location = New-Object System.Drawing.Point(330, $buttonsTop) # NEW
+  $btnPreset.Location = New-Object System.Drawing.Point(330, $buttonsTop)
   $btnAll.Location    = New-Object System.Drawing.Point(530, $buttonsTop)
   $btnNone.Location   = New-Object System.Drawing.Point(660, $buttonsTop)
-  $btnGP.Location     = New-Object System.Drawing.Point(10,  $buttonsTop + 40)
+  $buttonsTop2 = $buttonsTop + 40
+  $btnGP.Location     = New-Object System.Drawing.Point(10,  $buttonsTop2)
 
   $btnApply.Size  = New-Object System.Drawing.Size(150,32)
   $btnVerify.Size = New-Object System.Drawing.Size(150,32)
-  $btnPreset.Size = New-Object System.Drawing.Size(190,32)  # NEW
+  $btnPreset.Size = New-Object System.Drawing.Size(190,32)
   $btnAll.Size    = New-Object System.Drawing.Size(120,32)
   $btnNone.Size   = New-Object System.Drawing.Size(120,32)
   $btnGP.Size     = New-Object System.Drawing.Size(150,32)
 
-  $form.Controls.AddRange(@($btnApply,$btnVerify,$btnPreset,$btnAll,$btnNone,$btnGP))
+  $form.Controls.Add($btnApply)
+  $form.Controls.Add($btnVerify)
+  $form.Controls.Add($btnPreset)
+  $form.Controls.Add($btnAll)
+  $form.Controls.Add($btnNone)
+  $form.Controls.Add($btnGP)
 
   # Output textbox (log)
   $txt = New-Object System.Windows.Forms.TextBox
@@ -315,34 +326,30 @@ function Show-BaselineGui {
   $txt.ScrollBars = "Vertical"
   $txt.Size = New-Object System.Drawing.Size(800, 200)
   $txt.Location = New-Object System.Drawing.Point(10, 580)
-  $txt.Anchor = "Bottom,Left,Right"
+  $txt.Anchor = $anchorBottomLeftRight
   $form.Controls.Add($txt)
 
   function Log($s){ $line = ("[{0}] {1}" -f (Get-Date).ToString("HH:mm:ss"), $s); $txt.AppendText($line + [Environment]::NewLine); Write-Host $s }
 
-  # Preset selector (NEW): a sensible CyberPatriot baseline
+  # Preset selector
   function Select-Recommended {
-    # Start with all unchecked, then enable recommended set
     foreach($k in $cb.Keys){ $cb[$k].Checked = $false }
-
-    # Recommended CP defaults (adjust if your event has different scoring)
     foreach($k in @(
       # Core
       'PwdLockout','PwdRegistry','SecOptions','WinRM','Audit','Firewall','WU','DisableRDP',
       # Extras most commonly scored
       'NTLM','RemoteAssist','SMB1','NullSess','LLMNR','UAC','AutoRun','Defender','TLS','BadServices','EventLog',
-      # Often good to include:
+      # Often good to include
       'ScreenLock',
-      # Safe networking extras (use if allowed in your image):
+      # Safe networking extra (toggle if your image requires NetBIOS)
       'NetBIOS'
-      # Note: 'RDP_NLA' is useful only if you later enable RDP; we leave it off by default here.
     )) { $cb[$k].Checked = $true }
   }
 
   # Button events
   $btnAll.Add_Click({ foreach($k in $cb.Keys){ $cb[$k].Checked = $true } })
   $btnNone.Add_Click({ foreach($k in $cb.Keys){ $cb[$k].Checked = $false } })
-  $btnPreset.Add_Click({ Select-Recommended })  # NEW
+  $btnPreset.Add_Click({ Select-Recommended })
   $btnGP.Add_Click({ Log "Running gpupdate /force ..."; Run-GPUpdate; Log "gpupdate complete." })
 
   $btnApply.Add_Click({
@@ -391,4 +398,5 @@ function Show-BaselineGui {
 }
 
 # ------------------- Main -------------------
-try { Assert-Admin; New-Folder -Path $WorkingDir; Show-BaselineGui } catch { Write-Error $_.Exception.Message }
+try { Assert-Admin; New-Folder -Path $WorkingDir; Show-BaselineGui }
+catch { Write-Error $_.Exception.Message }

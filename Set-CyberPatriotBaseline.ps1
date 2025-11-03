@@ -52,7 +52,7 @@ function Export-CurrentSecurityPolicy($path) {
 }
 
 function Write-BaselineInf($path) {
-    # INF: implements points #7, #8, #9, #10 (SAM/shares), plus other safe defaults
+    # INF: implements password/lockout, blank passwords, anonymous SAM/shares, SMB signing
     $inf = @"
 [Unicode]
 Unicode=yes
@@ -63,14 +63,14 @@ Revision=1
 [System Access]
 ; --- Password Policy ---
 MinimumPasswordAge = 1
-MaximumPasswordAge = 90       ; (#7) Max password age = 90 days
+MaximumPasswordAge = 90       ; Max password age = 90 days
 MinimumPasswordLength = 14
 PasswordComplexity = 1
 PasswordHistorySize = 24
 ClearTextPassword = 0
 
 ; --- Account Lockout Policy ---
-LockoutBadCount = 10          ; (#8) Lockout threshold = 10 invalid attempts
+LockoutBadCount = 10          ; Lockout threshold = 10 invalid attempts
 ResetLockoutCount = 15
 LockoutDuration = 15
 
@@ -78,7 +78,7 @@ LockoutDuration = 15
 EnableGuestAccount = 0
 
 [Event Audit]
-; Legacy audit switches (Advanced Audit Policy is also set separately)
+; Legacy audit switches (Advanced Audit Policy set separately)
 AuditSystemEvents = 3
 AuditLogonEvents = 3
 AuditObjectAccess = 3
@@ -90,21 +90,20 @@ AuditDSAccess = 0
 AuditAccountLogon = 3
 
 [Registry Values]
-; (#9) Limit blank passwords to console logon only = Enabled
+; Limit blank passwords to console logon only = Enabled
 MACHINE\System\CurrentControlSet\Control\Lsa\LimitBlankPasswordUse=4,1
 
-; (#10) Do not allow anonymous enumeration of SAM accounts AND shares = Enabled
-; Enable both RestrictAnonymous and RestrictAnonymousSAM for coverage
+; Do not allow anonymous enumeration of SAM accounts AND shares = Enabled
 MACHINE\System\CurrentControlSet\Control\Lsa\restrictanonymous=4,1
 MACHINE\System\CurrentControlSet\Control\Lsa\RestrictAnonymousSAM=4,1
 
-; --- Do not store LM hash value on next password change ---
+; Do not store LM hash value on next password change
 MACHINE\System\CurrentControlSet\Control\Lsa\NoLMHash=4,1
 
-; --- Don’t force network logons to Guest ---
+; Don’t force network logons to Guest
 MACHINE\System\CurrentControlSet\Control\Lsa\ForceGuest=4,0
 
-; --- Require SMB signing (client & server) ---
+; Require SMB signing (client & server)
 MACHINE\System\CurrentControlSet\Services\LanmanWorkstation\Parameters\RequireSecuritySignature=4,1
 MACHINE\System\CurrentControlSet\Services\LanmanWorkstation\Parameters\EnableSecuritySignature=4,1
 MACHINE\System\CurrentControlSet\Services\LanmanServer\Parameters\RequireSecuritySignature=4,1
@@ -152,12 +151,9 @@ function Enable-FirewallAllProfiles {
 
 function Ensure-AutomaticUpdates {
     <#
-      Implements point #11:
-       - Sets "Configure Automatic Updates" policy = Enabled (AUOptions=4)
-       - Ensures Windows Update service is set to (Delayed) Automatic and running
-       - Clears any "Turn off Automatic Updates" style blocks (NoAutoUpdate=0)
-      Visible in gpedit.msc under:
-        Computer Configuration -> Administrative Templates -> Windows Components -> Windows Update
+      Configure Automatic Updates = Enabled (AUOptions=4),
+      ensure wuauserv is Automatic & running,
+      set Delayed Auto Start using sc.exe (5.1-friendly).
     #>
     Write-Host "Configuring Windows Update policy: 'Configure Automatic Updates' = Enabled..." -ForegroundColor Cyan
 
@@ -170,12 +166,33 @@ function Ensure-AutomaticUpdates {
     New-ItemProperty -Path $wuAU -Name "ScheduledInstallDay"  -Value 0 -PropertyType DWord -Force | Out-Null  # 0 = Every day
     New-ItemProperty -Path $wuAU -Name "ScheduledInstallTime" -Value 3 -PropertyType DWord -Force | Out-Null  # 3 = 3:00 AM
 
-    # Make sure Windows Update service is enabled and running
+    # Ensure Windows Update service exists
+    $svc = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
+    if ($null -eq $svc) {
+        Write-Warning "Windows Update service (wuauserv) not found on this system. Skipping service start."
+        return
+    }
+
+    # PowerShell 5.1 supports: Boot, System, Automatic, Manual, Disabled
+    try { Set-Service -Name wuauserv -StartupType Automatic } catch {
+        Write-Warning "Could not set wuauserv startup type to Automatic: $($_.Exception.Message)"
+    }
+
+    try { Start-Service -Name wuauserv -ErrorAction SilentlyContinue } catch {
+        Write-Warning "Could not start Windows Update service (wuauserv): $($_.Exception.Message)"
+    }
+
+    # Optional: set Delayed Auto Start without using unsupported enum
     try {
-        Set-Service -Name wuauserv -StartupType AutomaticDelayedStart
-        Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+        & sc.exe config wuauserv start= delayed-auto | Out-Null
     } catch {
-        Write-Warning "Could not set/start Windows Update service (wuauserv): $($_.Exception.Message)"
+        # Fallback on registry
+        try {
+            New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\wuauserv" `
+                             -Name "DelayedAutoStart" -Value 1 -PropertyType DWord -Force | Out-Null
+        } catch {
+            Write-Warning "Could not set DelayedAutoStart on wuauserv: $($_.Exception.Message)"
+        }
     }
 }
 

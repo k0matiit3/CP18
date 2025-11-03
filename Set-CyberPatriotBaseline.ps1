@@ -1,20 +1,27 @@
 <# 
 .SYNOPSIS
-  Applies a CyberPatriot-style local security baseline via secedit + auditpol.
-  - Backs up current Local Security Policy to an INF
-  - Applies hardened Account Policy & Security Options (via INF)
-  - Configures Advanced Audit Policy (via auditpol)
-  - Enables Windows Firewall on all profiles
+  Applies a CyberPatriot-style local security baseline (PowerShell 5.1).
+  Implements:
+   - Maximum password age = 90 days
+   - Account lockout threshold = 10 attempts
+   - Limit blank passwords to console logon only = Enabled
+   - Do not allow anonymous enumeration of SAM accounts and shares = Enabled
+   - Firewall enabled on all profiles
+   - Configure Automatic Updates = Enabled (auto download & schedule install)
+
+  Also:
+   - Backs up current Local Security Policy to INF
+   - Applies hardened Security Options (INF via secedit)
+   - Configures Advanced Audit Policy (auditpol)
 
 .PARAMETERS
-  -WorkingDir   : Folder to store backup and generated files (default: C:\CyberPatriotBaseline)
-  -TemplateName : Name for the template INF (default: cyberpatriot-baseline.inf)
+  -WorkingDir   : Folder for backup + template files (default: C:\CyberPatriotBaseline)
+  -TemplateName : Output INF template name (default: cyberpatriot-baseline.inf)
   -NoFirewall   : Skip enabling firewall if specified
 
 .NOTES
-  - Run as Administrator (elevated PowerShell).
+  - Run as Administrator.
   - PowerShell 5.1 compatible.
-  - secedit writes logs to %windir%\security\logs\ and %windir%\security\database\
 #>
 
 [CmdletBinding()]
@@ -25,25 +32,27 @@ param(
 )
 
 function Assert-Admin {
-    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw "This script must be run in an elevated PowerShell session (Run as Administrator)."
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = New-Object Security.Principal.WindowsPrincipal($id)
+    if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "Run this script in an elevated PowerShell session (Run as Administrator)."
     }
 }
 
 function New-Folder($path) {
-    if (-not (Test-Path $path)) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
+    if (-not (Test-Path $path)) {
+        New-Item -ItemType Directory -Path $path -Force | Out-Null
+    }
 }
 
 function Export-CurrentSecurityPolicy($path) {
     Write-Host "Backing up current Local Security Policy to:`n  $path" -ForegroundColor DarkGray
     secedit /export /cfg "$path" | Out-Null
-    if (-not (Test-Path $path)) { throw "Failed to export current policy to $path" }
+    if (-not (Test-Path $path)) { throw "Failed to export current Local Security Policy to $path" }
 }
 
 function Write-BaselineInf($path) {
-    # Hardened but sane defaults; adjust as needed
+    # INF: implements points #7, #8, #9, #10 (SAM/shares), plus other safe defaults
     $inf = @"
 [Unicode]
 Unicode=yes
@@ -52,22 +61,24 @@ signature=`"$CHICAGO$`"
 Revision=1
 
 [System Access]
-; --- Password & Lockout Policy ---
+; --- Password Policy ---
 MinimumPasswordAge = 1
-MaximumPasswordAge = 60
+MaximumPasswordAge = 90       ; (#7) Max password age = 90 days
 MinimumPasswordLength = 14
 PasswordComplexity = 1
 PasswordHistorySize = 24
 ClearTextPassword = 0
-; --- Lockout ---
-LockoutBadCount = 5
+
+; --- Account Lockout Policy ---
+LockoutBadCount = 10          ; (#8) Lockout threshold = 10 invalid attempts
 ResetLockoutCount = 15
 LockoutDuration = 15
+
 ; --- Guest account disabled ---
 EnableGuestAccount = 0
 
 [Event Audit]
-; (Legacy switches; Advanced Audit Policy will be applied separately below)
+; Legacy audit switches (Advanced Audit Policy is also set separately)
 AuditSystemEvents = 3
 AuditLogonEvents = 3
 AuditObjectAccess = 3
@@ -79,27 +90,28 @@ AuditDSAccess = 0
 AuditAccountLogon = 3
 
 [Registry Values]
-; --- Limit blank passwords to console logon only ---
+; (#9) Limit blank passwords to console logon only = Enabled
 MACHINE\System\CurrentControlSet\Control\Lsa\LimitBlankPasswordUse=4,1
-; --- Restrict anonymous enumeration of SAM accounts and shares ---
+
+; (#10) Do not allow anonymous enumeration of SAM accounts AND shares = Enabled
+; Enable both RestrictAnonymous and RestrictAnonymousSAM for coverage
 MACHINE\System\CurrentControlSet\Control\Lsa\restrictanonymous=4,1
+MACHINE\System\CurrentControlSet\Control\Lsa\RestrictAnonymousSAM=4,1
+
 ; --- Do not store LM hash value on next password change ---
 MACHINE\System\CurrentControlSet\Control\Lsa\NoLMHash=4,1
-; --- ForceGuest off (Don’t force network logons to Guest) ---
+
+; --- Don’t force network logons to Guest ---
 MACHINE\System\CurrentControlSet\Control\Lsa\ForceGuest=4,0
-; --- Require SMB signing (client) ---
+
+; --- Require SMB signing (client & server) ---
 MACHINE\System\CurrentControlSet\Services\LanmanWorkstation\Parameters\RequireSecuritySignature=4,1
 MACHINE\System\CurrentControlSet\Services\LanmanWorkstation\Parameters\EnableSecuritySignature=4,1
-; --- Require SMB signing (server) ---
 MACHINE\System\CurrentControlSet\Services\LanmanServer\Parameters\RequireSecuritySignature=4,1
 MACHINE\System\CurrentControlSet\Services\LanmanServer\Parameters\EnableSecuritySignature=4,1
 
 [Privilege Rights]
-; Keep simple here; CyberPatriot typically focuses on account & audit policy in SecPol.
-; You can extend with entries like:
-; SeDenyNetworkLogonRight = *S-1-5-7
-; SeDenyInteractiveLogonRight = *S-1-5-7
-; SeDenyRemoteInteractiveLogonRight = *S-1-5-32-546
+; Extend here if you want to set/deny specific user rights (Se* values).
 "@
 
     $inf | Set-Content -Path $path -Encoding Unicode
@@ -107,64 +119,63 @@ MACHINE\System\CurrentControlSet\Services\LanmanServer\Parameters\EnableSecurity
 
 function Apply-SecurityTemplate($infPath) {
     Write-Host "Applying security template:`n  $infPath" -ForegroundColor Cyan
-    # Use a fresh DB path per run to avoid locks
     $dbPath = Join-Path $env:WINDIR "security\database\cpbaseline.sdb"
     secedit /configure /db "$dbPath" /cfg "$infPath" /areas SECURITYPOLICY | Out-Null
 }
 
 function Set-AdvancedAuditPolicy {
     Write-Host "Configuring Advanced Audit Policy (success & failure for core categories)..." -ForegroundColor Cyan
-
-    # Categories chosen for strong visibility in CyberPatriot-like scoring:
     $cats = @(
-        "Account Logon",
-        "Account Management",
-        "DS Access",          # often not applicable on standalone, but harmless
-        "Logon/Logoff",
-        "Object Access",
-        "Policy Change",
-        "Privilege Use",
-        "System",
-        "Detailed Tracking"
+        "Account Logon","Account Management","DS Access","Logon/Logoff",
+        "Object Access","Policy Change","Privilege Use","System","Detailed Tracking"
     )
-
     foreach ($c in $cats) {
-        try {
-            auditpol /set /category:"$c" /success:enable /failure:enable | Out-Null
-        } catch {
-            Write-Warning "Failed setting audit policy for category '$c': $($_.Exception.Message)"
-        }
+        try { auditpol /set /category:"$c" /success:enable /failure:enable | Out-Null } catch {}
     }
 
-    # Optional: turn on a few noisy-but-useful subcategories explicitly (adjust as needed)
     $subs = @(
-        "Credential Validation",
-        "Computer Account Management",
-        "User Account Management",
-        "Logon",
-        "Logoff",
-        "Account Lockout",
-        "Security Group Management",
-        "Process Creation",
-        "Process Termination",
-        "Plug and Play Events",
-        "Removable Storage"
+        "Credential Validation","Computer Account Management","User Account Management",
+        "Logon","Logoff","Account Lockout","Security Group Management",
+        "Process Creation","Process Termination","Removable Storage"
     )
     foreach ($s in $subs) {
-        try {
-            auditpol /set /subcategory:"$s" /success:enable /failure:enable | Out-Null
-        } catch {
-            # Not all subcategories exist on all SKUs; ignore failures.
-        }
+        try { auditpol /set /subcategory:"$s" /success:enable /failure:enable | Out-Null } catch {}
     }
 }
 
 function Enable-FirewallAllProfiles {
     Write-Host "Enabling Windows Firewall for Domain, Private, and Public profiles..." -ForegroundColor Cyan
-    try {
-        netsh advfirewall set allprofiles state on | Out-Null
-    } catch {
+    try { netsh advfirewall set allprofiles state on | Out-Null } catch {
         Write-Warning "Failed to enable firewall: $($_.Exception.Message)"
+    }
+}
+
+function Ensure-AutomaticUpdates {
+    <#
+      Implements point #11:
+       - Sets "Configure Automatic Updates" policy = Enabled (AUOptions=4)
+       - Ensures Windows Update service is set to (Delayed) Automatic and running
+       - Clears any "Turn off Automatic Updates" style blocks (NoAutoUpdate=0)
+      Visible in gpedit.msc under:
+        Computer Configuration -> Administrative Templates -> Windows Components -> Windows Update
+    #>
+    Write-Host "Configuring Windows Update policy: 'Configure Automatic Updates' = Enabled..." -ForegroundColor Cyan
+
+    $wuAU = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+    if (-not (Test-Path $wuAU)) { New-Item -Path $wuAU -Force | Out-Null }
+
+    # Enable policy + set option "4" (Auto download and schedule install)
+    New-ItemProperty -Path $wuAU -Name "NoAutoUpdate"         -Value 0 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $wuAU -Name "AUOptions"            -Value 4 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $wuAU -Name "ScheduledInstallDay"  -Value 0 -PropertyType DWord -Force | Out-Null  # 0 = Every day
+    New-ItemProperty -Path $wuAU -Name "ScheduledInstallTime" -Value 3 -PropertyType DWord -Force | Out-Null  # 3 = 3:00 AM
+
+    # Make sure Windows Update service is enabled and running
+    try {
+        Set-Service -Name wuauserv -StartupType AutomaticDelayedStart
+        Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+    } catch {
+        Write-Warning "Could not set/start Windows Update service (wuauserv): $($_.Exception.Message)"
     }
 }
 
@@ -173,7 +184,7 @@ try {
     Assert-Admin
 
     New-Folder -path $WorkingDir
-    $backupInf = Join-Path $WorkingDir "backup-$(Get-Date -Format yyyyMMdd-HHmmss).inf"
+    $backupInf   = Join-Path $WorkingDir "backup-$(Get-Date -Format yyyyMMdd-HHmmss).inf"
     $baselineInf = Join-Path $WorkingDir $TemplateName
 
     Export-CurrentSecurityPolicy -path $backupInf
@@ -181,11 +192,12 @@ try {
     Apply-SecurityTemplate -infPath $baselineInf
     Set-AdvancedAuditPolicy
     if (-not $NoFirewall) { Enable-FirewallAllProfiles }
+    Ensure-AutomaticUpdates
 
     Write-Host "`nBaseline applied successfully." -ForegroundColor Green
     Write-Host "Backup of previous policy: $backupInf" -ForegroundColor DarkGray
     Write-Host "Template applied:          $baselineInf" -ForegroundColor DarkGray
-    Write-Host "`nYou may need to sign out/in for some settings to fully take effect." -ForegroundColor Yellow
+    Write-Host "`nSome settings may require sign-out/restart to fully take effect." -ForegroundColor Yellow
 }
 catch {
     Write-Error $_.Exception.Message

@@ -16,7 +16,7 @@ Covers:
   * Services: disable Remote Registry, SSDP, UPnP
   * Logging: increase Security log size, retention policy
 
-NOTE: Some settings may require restart or policy refresh to fully take effect.
+NOTE: Some settings may require restart or policy refresh to take full effect.
 #>
 
 [CmdletBinding()]
@@ -26,16 +26,16 @@ param(
 
 # ------------------- Helpers -------------------
 function Assert-Admin {
-  $id=[Security.Principal.WindowsIdentity]::GetCurrent()
-  $p =New-Object Security.Principal.WindowsPrincipal($id)
-  if(-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
+  $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $p  = New-Object Security.Principal.WindowsPrincipal($id)
+  if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "Run this script in an elevated PowerShell session (Run as Administrator)."
   }
 }
 
 function New-Folder {
   param([string]$Path)
-  if(-not (Test-Path $Path)){ New-Item -ItemType Directory -Path $Path -Force | Out-Null }
+  if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
 }
 
 function Ensure-RegistryKey {
@@ -63,45 +63,50 @@ function Set-RegMultiSz {
 
 # ------------------- Baseline setters (core) -------------------
 function Apply-PasswordAndLockoutPolicy {
+  Write-Host "Applying password/lockout policy via 'net accounts'..." -ForegroundColor Cyan
   & net accounts /maxpwage:90 /minpwlen:14 /uniquepw:24 | Out-Null
   & net accounts /lockoutthreshold:10 /lockoutduration:15 /lockoutwindow:15 | Out-Null
 }
 
 function Enforce-PasswordPolicyRegistry {
+  Write-Host "Reinforcing password policy in LSA registry (MinLen=14, Complexity=On, Reversible=Off)..." -ForegroundColor Cyan
   $lsa = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
-  Set-RegDWORD $lsa "MinimumPasswordLength" 14     # >=10 required
-  Set-RegDWORD $lsa "PasswordComplexity" 1         # complexity ON
-  Set-RegDWORD $lsa "ClearTextPassword" 0          # reversible OFF
+  Set-RegDWORD $lsa "MinimumPasswordLength" 14
+  Set-RegDWORD $lsa "PasswordComplexity"    1
+  Set-RegDWORD $lsa "ClearTextPassword"     0
 }
 
 function Write-SecurityOptionsRegistry {
+  Write-Host "Writing Security Options to registry..." -ForegroundColor Cyan
   $lsa = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
   Set-RegDWORD $lsa "LimitBlankPasswordUse" 1
-  Set-RegDWORD $lsa "restrictanonymous" 1
-  Set-RegDWORD $lsa "RestrictAnonymousSAM" 1
-  Set-RegDWORD $lsa "NoLMHash" 1
-  Set-RegDWORD $lsa "ForceGuest" 0
+  Set-RegDWORD $lsa "restrictanonymous"     1
+  Set-RegDWORD $lsa "RestrictAnonymousSAM"  1
+  Set-RegDWORD $lsa "NoLMHash"              1
+  Set-RegDWORD $lsa "ForceGuest"            0
 
-  # Require CTRL+ALT+DEL
+  # Require CTRL+ALT+DEL (DisableCAD=0)
   $polSys = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
   Set-RegDWORD $polSys "DisableCAD" 0
 
-  # SMB signing (client/server) + "always sign" implied by Require=1
+  # SMB signing (client/server)
   $wk = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters"
   $sv = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
   Set-RegDWORD $wk "RequireSecuritySignature" 1
-  Set-RegDWORD $wk "EnableSecuritySignature" 1
+  Set-RegDWORD $wk "EnableSecuritySignature"  1
   Set-RegDWORD $sv "RequireSecuritySignature" 1
-  Set-RegDWORD $sv "EnableSecuritySignature" 1
+  Set-RegDWORD $sv "EnableSecuritySignature"  1
 }
 
 function Configure-WinRM-DisallowUnencrypted {
+  Write-Host "Configuring WinRM to disallow unencrypted traffic..." -ForegroundColor Cyan
   $base = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM"
   Set-RegDWORD (Join-Path $base "Service") "AllowUnencryptedTraffic" 0
   Set-RegDWORD (Join-Path $base "Client")  "AllowUnencryptedTraffic" 0
 }
 
 function Disable-RemoteDesktop {
+  Write-Host "Disabling Remote Desktop connections..." -ForegroundColor Cyan
   $sysTS = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
   $polTS = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
   Set-RegDWORD $sysTS "fDenyTSConnections" 1
@@ -110,17 +115,28 @@ function Disable-RemoteDesktop {
 }
 
 function Set-AdvancedAuditPolicy {
-  $cats=@("Account Logon","Account Management","DS Access","Logon/Logoff","Object Access","Policy Change","Privilege Use","System","Detailed Tracking")
-  foreach($c in $cats){ try{ auditpol /set /category:"$c" /success:enable /failure:enable | Out-Null }catch{} }
-  $subs=@("Credential Validation","Computer Account Management","User Account Management","Logon","Logoff","Account Lockout","Security Group Management","Process Creation","Process Termination","Removable Storage")
-  foreach($s in $subs){ try{ auditpol /set /subcategory:"$s" /success:enable /failure:enable | Out-Null }catch{} }
+  Write-Host "Configuring Advanced Audit Policy..." -ForegroundColor Cyan
+  $cats=@(
+    "Account Logon","Account Management","DS Access","Logon/Logoff",
+    "Object Access","Policy Change","Privilege Use","System","Detailed Tracking"
+  )
+  foreach($c in $cats){ try{ auditpol /set /category:"$c" /success:enable /failure:enable | Out-Null } catch {} }
+
+  $subs=@(
+    "Credential Validation","Computer Account Management","User Account Management",
+    "Logon","Logoff","Account Lockout","Security Group Management",
+    "Process Creation","Process Termination","Removable Storage"
+  )
+  foreach($s in $subs){ try{ auditpol /set /subcategory:"$s" /success:enable /failure:enable | Out-Null } catch {} }
 }
 
 function Enable-FirewallAllProfiles {
-  try{ netsh advfirewall set allprofiles state on | Out-Null }catch{}
+  Write-Host "Enabling Windows Firewall (all profiles)..." -ForegroundColor Cyan
+  try { netsh advfirewall set allprofiles state on | Out-Null } catch {}
 }
 
 function Ensure-AutomaticUpdates {
+  Write-Host "Configuring Windows Update policy (Configure Automatic Updates = Enabled)..." -ForegroundColor Cyan
   $wu   = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
   $wuAU = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
   Set-RegDWORD $wuAU "NoAutoUpdate" 0
@@ -128,40 +144,45 @@ function Ensure-AutomaticUpdates {
   Set-RegDWORD $wuAU "ScheduledInstallDay" 0
   Set-RegDWORD $wuAU "ScheduledInstallTime" 3
   $svc = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
-  if($svc){ try{ Set-Service -Name wuauserv -StartupType Automatic }catch{}; try{ Start-Service wuauserv -ErrorAction SilentlyContinue }catch{}; try{ & sc.exe config wuauserv start= delayed-auto | Out-Null }catch{} }
+  if ($svc) {
+    try { Set-Service -Name wuauserv -StartupType Automatic } catch {}
+    try { Start-Service wuauserv -ErrorAction SilentlyContinue } catch {}
+    try { & sc.exe config wuauserv start= delayed-auto | Out-Null } catch {}
+  }
 }
 
 function Run-GPUpdate { try { gpupdate /target:computer /force | Out-Null } catch {} }
 
 # ------------------- EXTRA hardening buckets -------------------
-# Accounts & Auth
 function Harden-NTLM {
+  Write-Host "Applying NTLM hardening..." -ForegroundColor Cyan
   $lsa = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
-  Set-RegDWORD $lsa "LmCompatibilityLevel" 5   # NTLMv2 only, refuse LM/NTLM
+  Set-RegDWORD $lsa "LmCompatibilityLevel" 5
   Set-RegDWORD $lsa "DisableAnonymousSidNameTranslation" 1
-  # Explicitly disable Guest
   try { & net user guest /active:no | Out-Null } catch {}
 }
 
-# RDP extras
 function Require-RDP-NLA {
+  Write-Host "Requiring NLA for RDP (UserAuthentication=1)..." -ForegroundColor Cyan
   $rdpTcp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
-  Set-RegDWORD $rdpTcp "UserAuthentication" 1   # NLA
+  Set-RegDWORD $rdpTcp "UserAuthentication" 1
 }
 
 function Disable-RemoteAssistance {
+  Write-Host "Disabling Remote Assistance..." -ForegroundColor Cyan
   $ra = "HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance"
   Set-RegDWORD $ra "fAllowToGetHelp" 0
 }
 
-# Network & SMB/Legacy
 function Disable-SMBv1 {
+  Write-Host "Disabling SMBv1 (optional Windows feature + registry hints)..." -ForegroundColor Cyan
   try { Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction SilentlyContinue | Out-Null } catch {}
   try { Set-RegDWORD "HKLM:\SYSTEM\CurrentControlSet\Services\mrxsmb10" "Start" 4 } catch {}
   try { Set-RegDWORD "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" "SMB1" 0 } catch {}
 }
 
 function Lockdown-NullSessions {
+  Write-Host "Locking down null sessions..." -ForegroundColor Cyan
   $srv = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
   Set-RegDWORD $srv "RestrictNullSessAccess" 1
   Set-RegMultiSz $srv "NullSessionShares" @()
@@ -169,12 +190,13 @@ function Lockdown-NullSessions {
 }
 
 function Disable-LLMNR {
+  Write-Host "Disabling LLMNR..." -ForegroundColor Cyan
   $dnsCli = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
   Set-RegDWORD $dnsCli "EnableMulticast" 0
 }
 
 function Disable-NetBIOS {
-  # Iterate network interfaces and set NetbiosOptions=2 (disable)
+  Write-Host "Attempting to set NetBIOS disabled on all interfaces..." -ForegroundColor Cyan
   $base = "HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces"
   if (Test-Path $base) {
     Get-ChildItem $base | ForEach-Object {
@@ -183,19 +205,20 @@ function Disable-NetBIOS {
   }
 }
 
-# OS Hardening / UX
 function UAC-Strict {
+  Write-Host "Enabling UAC strict mode..." -ForegroundColor Cyan
   $polSys = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
   Set-RegDWORD $polSys "EnableLUA" 1
-  Set-RegDWORD $polSys "ConsentPromptBehaviorAdmin" 2  # Prompt for consent on secure desktop
+  Set-RegDWORD $polSys "ConsentPromptBehaviorAdmin" 2
 }
 
 function Disable-AutoRunAutoPlay {
+  Write-Host "Disabling AutoRun/AutoPlay..." -ForegroundColor Cyan
   Set-RegDWORD "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" "NoDriveTypeAutoRun" 255
 }
 
 function Enable-ScreenLock {
-  # Current user only; if running as different admin, this affects that account
+  Write-Host "Enabling screen lock for current user..." -ForegroundColor Cyan
   $desk = "HKCU:\SOFTWARE\Policies\Microsoft\Windows\Control Panel\Desktop"
   Ensure-RegistryKey -Path $desk
   Set-RegString $desk "ScreenSaveActive" "1"
@@ -203,19 +226,19 @@ function Enable-ScreenLock {
   Set-RegString $desk "ScreenSaveTimeOut" "900"
 }
 
-# Defender / SmartScreen
 function Configure-DefenderSmartScreen {
+  Write-Host "Configuring Defender & SmartScreen (best-effort)..." -ForegroundColor Cyan
   try {
     Set-MpPreference -DisableRealtimeMonitoring $false -MAPSReporting Advanced -SubmitSamplesConsent SendSafeSamples -ErrorAction SilentlyContinue
     Update-MpSignature -ErrorAction SilentlyContinue
   } catch {}
   $sys = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"
-  Set-RegDWORD  $sys "EnableSmartScreen" 1
+  Set-RegDWORD $sys "EnableSmartScreen" 1
   Set-RegString $sys "ShellSmartScreenLevel" "Block"
 }
 
-# TLS & crypto
 function Harden-SChannel {
+  Write-Host "Hardening SChannel/TLS settings..." -ForegroundColor Cyan
   $root = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols"
   $pairs = @(
     @{Proto="SSL 2.0"; En=0},
@@ -224,31 +247,36 @@ function Harden-SChannel {
     @{Proto="TLS 1.1"; En=0},
     @{Proto="TLS 1.2"; En=1}
   )
-  foreach($p in $pairs){
+  foreach ($p in $pairs) {
     $server = Join-Path $root ($p.Proto + "\Server")
     $client = Join-Path $root ($p.Proto + "\Client")
     Set-RegDWORD $server "Enabled" $p.En
     Set-RegDWORD $client "Enabled" $p.En
-    # Also ensure DisabledByDefault where appropriate (0 when enabled, 1 when disabled)
-    $dbd = ($p.En -eq 1) ? 0 : 1
+
+    if ($p.En -eq 1) {
+      $dbd = 0
+    } else {
+      $dbd = 1
+    }
+
     Set-RegDWORD $server "DisabledByDefault" $dbd
     Set-RegDWORD $client "DisabledByDefault" $dbd
   }
 }
 
-# Services
 function Disable-ProblemServices {
-  foreach($svc in @("RemoteRegistry","SSDPSRV","upnphost")){
+  Write-Host "Disabling RemoteRegistry, SSDPSRV, upnphost services..." -ForegroundColor Cyan
+  foreach ($svc in @("RemoteRegistry","SSDPSRV","upnphost")) {
     try { Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue } catch {}
     try { Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue } catch {}
   }
 }
 
-# Logging / Auditing polish
 function Tune-EventLog {
+  Write-Host "Tuning Security event log (MaxSize ~192MB)..." -ForegroundColor Cyan
   $sec = "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security"
-  Set-RegDWORD $sec "MaxSize" 196608  # ~192 MB
-  Set-RegDWORD $sec "Retention" 0     # Overwrite as needed (or set 1 for do not overwrite)
+  Set-RegDWORD $sec "MaxSize" 196608
+  Set-RegDWORD $sec "Retention" 0
 }
 
 # ------------------- Verification -------------------
@@ -256,7 +284,7 @@ function Verify-And-Report {
   Write-Host "`n===== Verification =====" -ForegroundColor White
   $dom = (Get-WmiObject Win32_ComputerSystem).PartOfDomain
   Write-Host ("Domain joined: " + ($dom -as [bool])) -ForegroundColor Yellow
-  if($dom){ Write-Host "NOTE: Domain GPOs may override local policy." -ForegroundColor DarkYellow }
+  if ($dom) { Write-Host "NOTE: Domain GPOs may override local policy." -ForegroundColor DarkYellow }
 
   Write-Host "`n-- net accounts --" -ForegroundColor Cyan
   cmd /c net accounts
@@ -268,52 +296,40 @@ function Verify-And-Report {
   netsh advfirewall show allprofiles | Out-String | Write-Host
 
   Write-Host "`n-- key registry checks --" -ForegroundColor Cyan
-  function ShowVal($Path,$Name){ try{ $v=(Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name }catch{$v=$null}; "{0} : {1}" -f "$Path\$Name",$v | Write-Host }
+  function ShowVal($Path,$Name){
+    try { $v = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } catch { $v = $null }
+    "{0}\{1} : {2}" -f $Path, $Name, $v | Write-Host
+  }
 
-  # Password policy (LSA), security options
-  $lsa="HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
-  foreach($n in "MinimumPasswordLength","PasswordComplexity","ClearTextPassword","LimitBlankPasswordUse","restrictanonymous","RestrictAnonymousSAM","NoLMHash","ForceGuest","LmCompatibilityLevel","DisableAnonymousSidNameTranslation"){ ShowVal $lsa $n }
+  $lsa = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+  foreach ($n in "MinimumPasswordLength","PasswordComplexity","ClearTextPassword","LimitBlankPasswordUse","restrictanonymous","RestrictAnonymousSAM","NoLMHash","ForceGuest","LmCompatibilityLevel","DisableAnonymousSidNameTranslation") {
+    ShowVal $lsa $n
+  }
 
-  # CAD
   ShowVal "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "DisableCAD"
-
-  # SMB signing, null sessions
   ShowVal "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters" "RequireSecuritySignature"
   ShowVal "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" "RequireSecuritySignature"
   ShowVal "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" "RestrictNullSessAccess"
-
-  # LLMNR
   ShowVal "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" "EnableMulticast"
-
-  # RDP & NLA
   ShowVal "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" "fDenyTSConnections"
   ShowVal "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" "UserAuthentication"
-
-  # Remote Assistance
   ShowVal "HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance" "fAllowToGetHelp"
-
-  # WinRM
   ShowVal "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service" "AllowUnencryptedTraffic"
   ShowVal "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client"  "AllowUnencryptedTraffic"
-
-  # Defender/SmartScreen
   ShowVal "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "EnableSmartScreen"
   ShowVal "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "ShellSmartScreenLevel"
 
-  # SChannel TLS
-  foreach($p in "SSL 2.0","SSL 3.0","TLS 1.0","TLS 1.1","TLS 1.2"){
+  foreach ($p in "SSL 2.0","SSL 3.0","TLS 1.0","TLS 1.1","TLS 1.2") {
     ShowVal ("HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\{0}\Server" -f $p) "Enabled"
     ShowVal ("HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\{0}\Client" -f $p) "Enabled"
   }
 
-  # Services state
-  foreach($svc in "RemoteRegistry","SSDPSRV","upnphost"){ try{ ("Service {0} : {1}" -f $svc, (Get-Service $svc -ErrorAction Stop).Status) | Write-Host }catch{} }
+  foreach ($svc in "RemoteRegistry","SSDPSRV","upnphost") {
+    try { ("Service {0} : {1}" -f $svc, (Get-Service $svc -ErrorAction Stop).Status) | Write-Host } catch {}
+  }
 
-  # Event log tuning
   ShowVal "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security" "MaxSize"
   ShowVal "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Security" "Retention"
-
-  # Windows Update policy quick check
   ShowVal "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" "AUOptions"
 }
 
@@ -371,7 +387,6 @@ function Show-BaselineGui {
   NewCB 'BadServices'  "Disable services: RemoteRegistry, SSDPSRV, upnphost"
   NewCB 'EventLog'     "Security log: ~192MB, overwrite as needed"
 
-  # Spacing
   $y += 6
 
   # Buttons
@@ -423,36 +438,36 @@ function Show-BaselineGui {
   }
 
   # Events
-  $btnAll.Add_Click({ foreach($k in $cb.Keys){ $cb[$k].Checked = $true } })
-  $btnNone.Add_Click({ foreach($k in $cb.Keys){ $cb[$k].Checked = $false } })
+  $btnAll.Add_Click({ foreach ($k in $cb.Keys) { $cb[$k].Checked = $true } })
+  $btnNone.Add_Click({ foreach ($k in $cb.Keys) { $cb[$k].Checked = $false } })
   $btnGP.Add_Click({ Log "Running gpupdate /force ..."; Run-GPUpdate; Log "gpupdate complete." })
 
   $btnApply.Add_Click({
-    try{
+    try {
       Log "Applying selected features..."
-      if($cb.PwdLockout.Checked){   Log " - Password & Lockout";         Apply-PasswordAndLockoutPolicy }
-      if($cb.PwdRegistry.Checked){  Log " - Password Registry";          Enforce-PasswordPolicyRegistry }
-      if($cb.SecOptions.Checked){   Log " - Security Options";           Write-SecurityOptionsRegistry }
-      if($cb.WinRM.Checked){        Log " - WinRM Harden";               Configure-WinRM-DisallowUnencrypted }
-      if($cb.Audit.Checked){        Log " - Audit Policy";               Set-AdvancedAuditPolicy }
-      if($cb.Firewall.Checked){     Log " - Firewall";                   Enable-FirewallAllProfiles }
-      if($cb.DisableRDP.Checked){   Log " - Disable RDP";                Disable-RemoteDesktop }
-      if($cb.WU.Checked){           Log " - Windows Update";             Ensure-AutomaticUpdates }
+      if ($cb.PwdLockout.Checked) { Log " - Password & Lockout";         Apply-PasswordAndLockoutPolicy }
+      if ($cb.PwdRegistry.Checked) { Log " - Password Registry";          Enforce-PasswordPolicyRegistry }
+      if ($cb.SecOptions.Checked) { Log " - Security Options";           Write-SecurityOptionsRegistry }
+      if ($cb.WinRM.Checked) {        Log " - WinRM Harden";               Configure-WinRM-DisallowUnencrypted }
+      if ($cb.Audit.Checked) {        Log " - Audit Policy";               Set-AdvancedAuditPolicy }
+      if ($cb.Firewall.Checked) {     Log " - Firewall";                   Enable-FirewallAllProfiles }
+      if ($cb.DisableRDP.Checked) {   Log " - Disable RDP";                Disable-RemoteDesktop }
+      if ($cb.WU.Checked) {           Log " - Windows Update";             Ensure-AutomaticUpdates }
 
-      if($cb.NTLM.Checked){         Log " - NTLM hardening";             Harden-NTLM }
-      if($cb.RDP_NLA.Checked){      Log " - RDP NLA";                    Require-RDP-NLA }
-      if($cb.RemoteAssist.Checked){ Log " - Disable Remote Assistance";  Disable-RemoteAssistance }
-      if($cb.SMB1.Checked){         Log " - Disable SMBv1";              Disable-SMBv1 }
-      if($cb.NullSess.Checked){     Log " - Lockdown null sessions";     Lockdown-NullSessions }
-      if($cb.LLMNR.Checked){        Log " - Disable LLMNR";              Disable-LLMNR }
-      if($cb.NetBIOS.Checked){      Log " - Disable NetBIOS";            Disable-NetBIOS }
-      if($cb.UAC.Checked){          Log " - UAC strict";                 UAC-Strict }
-      if($cb.AutoRun.Checked){      Log " - Disable AutoRun/AutoPlay";   Disable-AutoRunAutoPlay }
-      if($cb.ScreenLock.Checked){   Log " - Screen lock (current user)"; Enable-ScreenLock }
-      if($cb.Defender.Checked){     Log " - Defender/SmartScreen";       Configure-DefenderSmartScreen }
-      if($cb.TLS.Checked){          Log " - SChannel TLS hardening";     Harden-SChannel }
-      if($cb.BadServices.Checked){  Log " - Disable services";           Disable-ProblemServices }
-      if($cb.EventLog.Checked){     Log " - Tune Security log";          Tune-EventLog }
+      if ($cb.NTLM.Checked) {         Log " - NTLM hardening";             Harden-NTLM }
+      if ($cb.RDP_NLA.Checked) {      Log " - RDP NLA";                    Require-RDP-NLA }
+      if ($cb.RemoteAssist.Checked) { Log " - Disable Remote Assistance";  Disable-RemoteAssistance }
+      if ($cb.SMB1.Checked) {         Log " - Disable SMBv1";              Disable-SMBv1 }
+      if ($cb.NullSess.Checked) {     Log " - Lockdown null sessions";     Lockdown-NullSessions }
+      if ($cb.LLMNR.Checked) {        Log " - Disable LLMNR";              Disable-LLMNR }
+      if ($cb.NetBIOS.Checked) {      Log " - Disable NetBIOS";            Disable-NetBIOS }
+      if ($cb.UAC.Checked) {          Log " - UAC strict";                 UAC-Strict }
+      if ($cb.AutoRun.Checked) {      Log " - Disable AutoRun/AutoPlay";   Disable-AutoRunAutoPlay }
+      if ($cb.ScreenLock.Checked) {   Log " - Screen lock (current user)"; Enable-ScreenLock }
+      if ($cb.Defender.Checked) {     Log " - Defender/SmartScreen";       Configure-DefenderSmartScreen }
+      if ($cb.TLS.Checked) {          Log " - SChannel TLS hardening";     Harden-SChannel }
+      if ($cb.BadServices.Checked) {  Log " - Disable services";           Disable-ProblemServices }
+      if ($cb.EventLog.Checked) {     Log " - Tune Security log";          Tune-EventLog }
 
       Log "Applying gpupdate (recommended)..."
       Run-GPUpdate
@@ -464,7 +479,7 @@ function Show-BaselineGui {
   })
 
   $btnVerify.Add_Click({
-    try{
+    try {
       Log "Verification only..."
       Verify-And-Report
       Log "Done."

@@ -334,7 +334,7 @@ function Show-SyncGui {
   $splitMain.FixedPanel = 'Panel1'
   $splitMain.Panel1MinSize = 220
   $splitMain.Panel2MinSize = 300
-  $splitMain.SplitterDistance = 220
+  # don't touch SplitterDistance until form is shown
   $form.Controls.Add($splitMain)
 
   # ---------- TOP panel ----------
@@ -397,9 +397,10 @@ function Show-SyncGui {
   $splitBottom.Dock = 'Fill'
   $splitBottom.Orientation = 'Horizontal'
   $splitBottom.FixedPanel = 'Panel2'
+  $splitBottom.Panel1MinSize = 150
   $splitBottom.Panel2MinSize = 220
   $splitBottom.SplitterWidth = 6
-  $splitBottom.SplitterDistance = 360
+  # DO NOT set SplitterDistance here; we’ll do it after the form is shown
   $splitMain.Panel2.Controls.Add($splitBottom)
 
   # ----- Middle: GRID -----
@@ -659,7 +660,15 @@ function Show-SyncGui {
     }
   })
 
-  $form.Add_Shown({ $form.Activate() })
+  # After form is shown, we can safely set splitter distances
+  $form.Add_Shown({
+    # ~25% top, 75% bottom for main
+    $splitMain.SplitterDistance = [int]($form.ClientSize.Height * 0.26)
+    # ~60% grid, 40% log
+    $splitBottom.SplitterDistance = [int]($splitMain.Panel2.ClientSize.Height * 0.6)
+    $form.Activate()
+  })
+
   [void]$form.ShowDialog()
 }
 

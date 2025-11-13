@@ -327,13 +327,17 @@ function Show-SyncGui {
   $form.StartPosition = "CenterScreen"
 
   # Main split: top (paste+controls), bottom (grid+log)
+   # Main split: top (paste+controls), bottom (grid+log)
   $splitMain = New-Object System.Windows.Forms.SplitContainer
   $splitMain.Dock = 'Fill'
   $splitMain.Orientation = 'Horizontal'
   $splitMain.SplitterWidth = 6
   $splitMain.FixedPanel = 'Panel1'
   $splitMain.Panel1MinSize = 220
-  $splitMain.Panel2MinSize = 300
+  # DO NOT set Panel2MinSize here
+  # DO NOT set SplitterDistance yet (do it in the Shown handler)
+  $form.Controls.Add($splitMain)
+
   # don't touch SplitterDistance until form is shown
   $form.Controls.Add($splitMain)
 
@@ -392,14 +396,17 @@ function Show-SyncGui {
   $chkDelete.Location = '330,196'
   $pTop.Controls.Add($chkDelete)
 
-  # ---------- BOTTOM split: grid + log ----------
+    # ---------- BOTTOM split: grid + log ----------
   $splitBottom = New-Object System.Windows.Forms.SplitContainer
   $splitBottom.Dock = 'Fill'
   $splitBottom.Orientation = 'Horizontal'
   $splitBottom.FixedPanel = 'Panel2'
   $splitBottom.Panel1MinSize = 150
-  $splitBottom.Panel2MinSize = 220
+  # DO NOT set Panel2MinSize here
   $splitBottom.SplitterWidth = 6
+  # DO NOT set SplitterDistance yet (do it in the Shown handler)
+  $splitMain.Panel2.Controls.Add($splitBottom)
+
   # DO NOT set SplitterDistance here; we’ll do it after the form is shown
   $splitMain.Panel2.Controls.Add($splitBottom)
 
@@ -680,3 +687,4 @@ try {
 catch {
   Write-Error $_.Exception.Message
 }
+
